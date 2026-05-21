@@ -1,0 +1,1090 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import asdict
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from typing import Any
+
+_log = logging.getLogger(__name__)
+
+import pandas as pd
+import requests
+
+from config import TRADE
+from data_provider import get_last_price
+from holdings import apply_buy, apply_sell, load_holdings, save_holdings
+from notifier import PushPlusNotifier
+from pending_orders import PendingOrder, expire_pending_orders, find_pending_match, load_pending_orders, save_pending_orders
+from report import append_trade_record
+from risk_manager import append_trade_log
+from secrets_loader import get_cursor_api_key, load_secrets_env
+
+# 支持查询的股票代码正则（US.CRWV 或 CRWV 形式）
+_TICKER_RE = re.compile(r"\b(?:US\.)?([A-Z]{1,6})\b")
+
+# ClawBot → Cursor Agent 消息队列（与 exe 工作目录 logs/ 对齐）
+def _ai_queue_path() -> str:
+    return os.path.join(os.getcwd(), "logs", "clawbot_ai_queue.json")
+
+
+def _project_root() -> str:
+    cwd = os.path.abspath(os.getcwd())
+    if os.path.basename(cwd).lower() == "dist":
+        return os.path.dirname(cwd)
+    return cwd
+
+
+def _find_node_executable() -> str | None:
+    """
+    Resolve node.exe for clawbot_bridge.
+    PyInstaller/GUI 启动时 PATH 往往不含 node；可设 TP_NODE_PATH 覆盖。
+    """
+    override = (os.getenv("TP_NODE_PATH") or "").strip().strip('"')
+    if override:
+        if os.path.isfile(override):
+            return os.path.abspath(override)
+        _log.warning("[ClawBot] TP_NODE_PATH 不存在: %s", override)
+
+    found = shutil.which("node")
+    if found and os.path.isfile(found):
+        return os.path.abspath(found)
+
+    for part in (os.environ.get("PATH") or "").split(os.pathsep):
+        part = part.strip()
+        if not part:
+            continue
+        p = os.path.join(part, "node.exe")
+        if os.path.isfile(p):
+            return os.path.abspath(p)
+
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    appdata = os.environ.get("APPDATA", "")
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+
+    static_candidates: list[str] = []
+    nvm_symlink = (os.getenv("NVM_SYMLINK") or "").strip()
+    if nvm_symlink:
+        static_candidates.append(os.path.join(nvm_symlink, "node.exe"))
+
+    static_candidates.extend(
+        [
+            os.path.join(program_files, "nodejs", "node.exe"),
+            os.path.join(program_files_x86, "nodejs", "node.exe"),
+            os.path.join(
+                localappdata,
+                "Programs",
+                "cursor",
+                "resources",
+                "app",
+                "resources",
+                "helpers",
+                "node.exe",
+            ),
+        ]
+    )
+
+    if sys.platform == "win32" and appdata:
+        nvm_home = (os.getenv("NVM_HOME") or os.path.join(appdata, "nvm")).strip()
+        if os.path.isdir(nvm_home):
+            try:
+                vers = sorted(
+                    (d for d in os.listdir(nvm_home) if d.lower().startswith("v")),
+                    reverse=True,
+                )
+                for v in vers:
+                    p = os.path.join(nvm_home, v, "node.exe")
+                    if os.path.isfile(p):
+                        static_candidates.append(p)
+                        break
+            except OSError:
+                pass
+
+    for p in static_candidates:
+        if p and os.path.isfile(p):
+            return os.path.abspath(p)
+
+    return None
+
+
+def _futu_display_pl_pct(row: Any) -> float:
+    """
+    富途持仓接口的 pl_ratio（文档称已为百分数）在部分情况下会返回量级错误（如 -1267 表示 -12.67%）。
+    用 pl_val 与摊薄成本基数交叉校验，明显不一致时以金额口径为准。
+    """
+    try:
+        raw = float(row.get("pl_ratio") or 0)
+    except Exception:
+        raw = 0.0
+    try:
+        pl_val = float(row.get("pl_val") or row.get("unrealized_pl") or 0)
+    except Exception:
+        pl_val = 0.0
+    try:
+        qty = float(row.get("qty") or 0)
+        cost_price = float(row.get("cost_price") or row.get("pl_cost_price") or 0)
+    except Exception:
+        qty = 0.0
+        cost_price = 0.0
+
+    cost_basis = abs(cost_price * qty) if qty and cost_price else 0.0
+    if cost_basis <= 1e-9:
+        return raw
+
+    computed = (pl_val / cost_basis) * 100.0
+
+    valid = row.get("pl_ratio_valid")
+    if valid is False:
+        return computed
+
+    if abs(raw) > 500:
+        return computed
+    if abs(computed) > 1e-6 and abs(raw / computed) > 8.0 and abs(raw) > 40.0:
+        return computed
+    return raw
+
+
+def _build_broker_context(broker) -> dict:
+    ctx: dict = {}
+    if broker is None:
+        return ctx
+    try:
+        ctx["cash"] = float(broker.get_available_cash())
+    except Exception:
+        pass
+    try:
+        ctx["total_assets"] = float(broker.get_total_assets())
+    except Exception:
+        pass
+    try:
+        df = broker.get_positions()
+        positions: list[dict] = []
+        if df is not None and not df.empty:
+            for _, row in df.iterrows():
+                positions.append(
+                    {
+                        "symbol": str(row.get("code", "")),
+                        "qty": int(float(row.get("qty", 0))),
+                        "cost": float(row.get("cost_price", 0) or 0),
+                        "pl_ratio": float(_futu_display_pl_pct(row)),
+                    }
+                )
+        ctx["positions"] = positions
+    except Exception:
+        pass
+    return ctx
+
+
+def _enqueue_ai_message(
+    text: str,
+    msg_id: str,
+    *,
+    broker=None,
+) -> None:
+    """
+    将 ClawBot 用户原话写入队列，由 clawbot_bridge.mjs 转发给 Cursor Agent 理解并回复。
+    不再依赖关键词硬匹配。
+    """
+    queue_path = _ai_queue_path()
+    os.makedirs(os.path.dirname(queue_path), exist_ok=True)
+    try:
+        try:
+            with open(queue_path, "r", encoding="utf-8") as f:
+                queue: list = json.load(f) or []
+        except Exception:
+            queue = []
+        existing_ids = {m.get("msg_id") for m in queue}
+        if msg_id not in existing_ids:
+            queue.append(
+                {
+                    "msg_id": msg_id,
+                    "text": text,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "status": "pending",
+                    "context": _build_broker_context(broker),
+                }
+            )
+            with open(queue_path, "w", encoding="utf-8") as f:
+                json.dump(queue[-500:], f, ensure_ascii=False, indent=2)
+            _log.info("[ClawBot] 已入队 Cursor AI: %s", text[:80])
+    except Exception as e:
+        _log.error("[ClawBot] enqueue_ai_message error: %s", e)
+
+
+def _handle_clawbot_query(text: str, *, notifier: PushPlusNotifier, broker=None) -> bool:
+    """
+    尝试将用户消息识别为查询请求并回复。
+    返回 True 表示已处理（无需再当作确认码处理）。
+    支持：
+      - 余额/账户查询：含「余额」「现金」「账户」「资产」「总资产」
+      - 新闻/消息查询：含「新闻」「消息」「怎么样」「如何」「最新」
+      - 价格查询：含「价格」「多少」「现在」「涨」「跌」
+      - 持仓查询：含「持仓」「我的」「仓位」
+      - 帮助：「帮助」「help」
+    """
+    t = text.strip()
+    tl = t.lower()
+
+    # 帮助
+    if any(kw in tl for kw in ("帮助", "help", "怎么用", "命令", "指令")):
+        notifier.send(
+            title="📖 TradePilot 指令帮助",
+            content=(
+                "支持以下查询（直接发送给 ClawBot）：\n\n"
+                "【账户查询】\n"
+                "  我的余额\n"
+                "  账户资产\n\n"
+                "【持仓查询】\n"
+                "  我的持仓\n\n"
+                "【新闻查询】\n"
+                "  CRWV最新消息\n"
+                "  有关VOO的新闻吗\n\n"
+                "【价格查询】\n"
+                "  CRWV现在多少\n"
+                "  TQQQ价格\n\n"
+                "【确认下单】\n"
+                "  直接发 confirm_code（如 A3F9）\n"
+                "  或完整格式：YES BUY US.VOO 1 A3F9"
+            ),
+        )
+        return True
+
+    # 余额/账户查询
+    if any(kw in tl for kw in ("余额", "现金", "账户", "资产", "总资产", "balance", "cash")):
+        lines = []
+        if broker is not None:
+            try:
+                cash = float(broker.get_available_cash())
+                lines.append(f"可用现金：${cash:.2f}")
+            except Exception:
+                lines.append("可用现金：获取失败")
+            try:
+                assets = float(broker.get_total_assets())
+                lines.append(f"总资产：${assets:.2f}")
+            except Exception:
+                lines.append("总资产：获取失败")
+        else:
+            lines.append("账户数据暂不可用（broker未连接）")
+        # 同时附上持仓简况（优先读 broker 实时数据）
+        lines.append("")
+        if broker is not None:
+            try:
+                df = broker.get_positions()
+                if df is not None and not df.empty:
+                    lines.append("当前持仓：")
+                    for _, row in df.iterrows():
+                        code = str(row.get("code", "")).replace("US.", "")
+                        qty = int(float(row.get("qty", 0)))
+                        cost = float(row.get("cost_price", row.get("pl_cost_price", 0)) or 0)
+                        pl_pct = _futu_display_pl_pct(row)
+                        lines.append(f"  {code}: {qty}股 成本${cost:.2f} 盈亏{pl_pct:+.1f}%")
+                else:
+                    lines.append("当前无持仓")
+            except Exception:
+                lines.append("（持仓数据获取失败）")
+        else:
+            try:
+                holdings = load_holdings()
+                active = [h for h in holdings if int(h.qty) > 0]
+                if active:
+                    lines.append("当前持仓（本地记录）：")
+                    for h in active:
+                        sym = str(h.symbol).replace("US.", "")
+                        lines.append(f"  {sym}: {h.qty}股 @ ${float(h.buy_price):.2f}")
+                else:
+                    lines.append("当前无持仓")
+            except Exception:
+                pass
+        notifier.send(title="💰 账户余额", content="\n".join(lines))
+        return True
+
+    # 持仓查询
+    if any(kw in tl for kw in ("持仓", "我的仓", "仓位", "portfolio", "holding")):
+        lines = []
+        # 优先读 broker 实时持仓（Futu 真实数据）
+        if broker is not None:
+            try:
+                df = broker.get_positions()
+                if df is not None and not df.empty:
+                    lines.append("【Futu 实时持仓】")
+                    for _, row in df.iterrows():
+                        code = str(row.get("code", "")).replace("US.", "")
+                        qty = int(float(row.get("qty", 0)))
+                        cost = float(row.get("cost_price", row.get("pl_cost_price", 0)) or 0)
+                        market_val = float(row.get("market_val", 0) or 0)
+                        pl = float(row.get("pl_val", row.get("unrealized_pl", 0)) or 0)
+                        pl_pct = _futu_display_pl_pct(row)
+                        lines.append(
+                            f"  {code}: {qty}股 成本${cost:.2f} "
+                            f"市值${market_val:.2f} 盈亏${pl:+.2f}({pl_pct:+.1f}%)"
+                        )
+                    if not lines[1:]:  # 只有标题没有数据
+                        lines = ["Futu 账户当前无持仓"]
+                else:
+                    lines.append("Futu 账户当前无持仓")
+            except Exception as e:
+                lines.append(f"Futu 实时持仓获取失败: {e}")
+                # 降级读本地文件
+                try:
+                    holdings = load_holdings()
+                    active = [h for h in holdings if int(h.qty) > 0]
+                    if active:
+                        lines.append("【本地记录（可能不准）】")
+                        for h in active:
+                            sym = str(h.symbol).replace("US.", "")
+                            lines.append(f"  {sym}: {h.qty}股 @ 成本${float(h.buy_price):.2f}")
+                except Exception:
+                    pass
+        else:
+            # 无 broker 时读本地文件
+            try:
+                holdings = load_holdings()
+                active = [h for h in holdings if int(h.qty) > 0]
+                if active:
+                    lines.append("【本地记录（可能不准确，请以 Futu 为准）】")
+                    for h in active:
+                        sym = str(h.symbol).replace("US.", "")
+                        lines.append(f"  {sym}: {h.qty}股 @ 成本${float(h.buy_price):.2f}")
+                else:
+                    lines.append("本地记录无持仓（broker 未连接，无法读 Futu 实时数据）")
+            except Exception as e:
+                lines.append(f"查询持仓失败: {e}")
+        notifier.send(title="📊 持仓查询", content="\n".join(lines))
+        return True
+
+    # 提取股票代码
+    tickers = [m.group(1).upper() for m in _TICKER_RE.finditer(t.upper())]
+    # 过滤明显不是股票的词
+    skip = {"YES", "BUY", "SELL", "THE", "AND", "FOR", "ARE", "YOU", "CAN", "有", "的", "吗"}
+    tickers = [tk for tk in tickers if tk not in skip and len(tk) >= 2]
+
+    is_news_query = any(kw in tl for kw in ("新闻", "消息", "最新", "怎么样", "如何", "有没有", "动态", "公告", "news"))
+    is_price_query = any(kw in tl for kw in ("价格", "多少", "现在", "涨", "跌", "price", "quote", "行情"))
+
+    # 只要提到股票代码（比如“CRWV”），即使没有显式关键词，也默认给出「价格 + 最新新闻摘要」，
+    # 避免用户必须记指令关键词。
+    if tickers and (not is_news_query and not is_price_query):
+        is_news_query = True
+        is_price_query = True
+
+    if not tickers:
+        return False  # 不是查询，交给确认码处理器
+
+    ticker = tickers[0]  # 取第一个识别到的股票
+    code_full = ticker if ticker.startswith("US.") else f"US.{ticker}"
+
+    # 价格/新闻查询（可组合输出）
+    out_lines: list[str] = []
+    if is_price_query:
+        try:
+            from news_verdict_tracker import _fetch_yahoo_price
+            price = _fetch_yahoo_price(ticker)
+            if price:
+                out_lines.append(f"当前价格：${price:.2f}（Yahoo，可能有延迟）")
+            else:
+                out_lines.append("当前价格：获取失败")
+        except Exception as e:
+            out_lines.append(f"当前价格：查询异常 {type(e).__name__}: {e}")
+
+    if is_news_query:
+        try:
+            from market_context import classify_news_impact, fetch_news_summary, format_news_title_lines
+            news = fetch_news_summary(code_full, max_items=5)
+            if news is None or not news.titles:
+                out_lines.append("最新新闻：暂无（RSS 未返回内容）")
+            else:
+                verdict, bull, bear = classify_news_impact(news)
+                bull_s = "、".join(bull[:4]) if bull else "无"
+                bear_s = "、".join(bear[:4]) if bear else "无"
+                out_lines.append(f"舆情判断：{verdict}")
+                out_lines.append(f"利好线索：{bull_s}")
+                out_lines.append(f"利空线索：{bear_s}")
+                out_lines.append("")
+                out_lines.append("最新头条：")
+                out_lines.extend(format_news_title_lines(news.titles, max_items=5))
+        except Exception as e:
+            out_lines.append(f"最新新闻：查询异常 {type(e).__name__}: {e}")
+
+    if not out_lines:
+        return False
+    notifier.send(title=f"📰 {ticker} 新闻/行情", content="\n".join(out_lines))
+    return True
+
+    return False
+
+
+PUSHPLUS_ACCESS_KEY_ENV = "PUSHPLUS_ACCESS_KEY"  # optional manual override
+PUSHPLUS_SECRET_KEY_ENV = "PUSHPLUS_SECRET_KEY"  # used to fetch accessKey
+PUSHPLUS_TOKEN_ENV = "PUSHPLUS_TOKEN"  # user token (NOT message token)
+PUSHPLUS_GET_ACCESS_KEY = "https://www.pushplus.plus/api/common/openApi/getAccessKey"
+PUSHPLUS_OPENAPI_LIST = "https://www.pushplus.plus/api/open/message/list"
+PUSHPLUS_SHORT_MESSAGE = "https://www.pushplus.plus/shortMessage/{shortCode}"
+PUSHPLUS_CLAWBOT_GETMSG = "https://www.pushplus.plus/api/open/clawBot/getMsg"
+
+STATE_PATH = os.path.join("logs", "pushplus_confirm_state.json")
+
+# Require title prefix to reduce accidental triggers.
+TITLE_PREFIX = "TP_CONFIRM"
+
+CMD_RE = re.compile(r"^YES\s+(BUY|SELL)\s+([A-Z]{2}\.[A-Z0-9]+)\s+(\d+)\s+([A-Z0-9]{4,16})$")
+CODE_ONLY_RE = re.compile(r"^[A-Z0-9]{4,16}$")
+
+_PUSHPLUS_TIME_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _now_iso() -> str:
+    return _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _is_recent_message(update_time: str, *, max_age_seconds: int) -> bool:
+    """
+    PushPlus OpenAPI returns updateTime like "YYYY-MM-DD HH:MM:SS" (no timezone).
+    We treat it as local time and ignore old confirmations to avoid processing historical test messages.
+    """
+    try:
+        if not update_time:
+            return False
+        dt_local = datetime.strptime(str(update_time).strip()[:19], _PUSHPLUS_TIME_FMT)
+        age = time.time() - dt_local.timestamp()
+        return age >= 0 and age <= float(max_age_seconds)
+    except Exception:
+        return False
+
+
+def _extract_order_id(data: Any) -> str | None:
+    if isinstance(data, pd.DataFrame) and not data.empty and "order_id" in data.columns:
+        try:
+            return str(data.iloc[0]["order_id"])
+        except Exception:
+            return None
+    return None
+
+
+def _access_key() -> str:
+    # 1) Manual override (fixed accessKey, 2h expiry unknown to us)
+    ak = (os.getenv(PUSHPLUS_ACCESS_KEY_ENV) or "").strip()
+    if ak:
+        return ak
+
+    # 2) Cached accessKey (recommended)
+    st = _load_state()
+    cached = str(st.get("accessKey") or "").strip()
+    exp_ts = float(st.get("accessKeyExpiresAtEpoch") or 0.0)
+    now = time.time()
+    # Keep a small buffer to avoid edge expiry.
+    if cached and exp_ts and now < (exp_ts - 120):
+        return cached
+
+    # 3) Fetch new accessKey using token + secretKey
+    token = (os.getenv(PUSHPLUS_TOKEN_ENV) or "").strip()
+    secret = (os.getenv(PUSHPLUS_SECRET_KEY_ENV) or "").strip()
+    if not token or not secret:
+        return ""
+    try:
+        resp = requests.post(PUSHPLUS_GET_ACCESS_KEY, json={"token": token, "secretKey": secret}, timeout=20)
+        if not resp.ok:
+            # Surface error to help user configure 开发设置/安全IP.
+            print(
+                f"[pushplus_confirm] getAccessKey failed: http={resp.status_code} body={resp.text[:300]}",
+                flush=True,
+            )
+            return ""
+        payload = resp.json() or {}
+        if isinstance(payload, dict):
+            biz_code = payload.get("code")
+            if biz_code not in (200, "200"):
+                print(f"[pushplus_confirm] getAccessKey rejected: {str(payload)[:300]}", flush=True)
+                return ""
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            print(f"[pushplus_confirm] getAccessKey bad response: {str(payload)[:300]}", flush=True)
+            return ""
+        new_ak = str(data.get("accessKey") or "").strip()
+        expires_in = float(data.get("expiresIn") or 0.0)
+        if not new_ak:
+            print(f"[pushplus_confirm] getAccessKey missing accessKey: {str(payload)[:300]}", flush=True)
+            return ""
+        st["accessKey"] = new_ak
+        st["accessKeyExpiresAtEpoch"] = time.time() + max(expires_in, 0.0)
+        _save_state(st)
+        return new_ak
+    except Exception as e:
+        print(f"[pushplus_confirm] getAccessKey exception: {type(e).__name__}: {e}", flush=True)
+        return ""
+
+
+def _load_state() -> dict:
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    if not os.path.exists(STATE_PATH):
+        return {"processed_shortcodes": []}
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f) or {"processed_shortcodes": []}
+    except Exception:
+        return {"processed_shortcodes": []}
+
+
+def _save_state(state: dict) -> None:
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+class _TextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._chunks: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        s = str(data or "").strip()
+        if s:
+            self._chunks.append(s)
+
+    def text(self) -> str:
+        # Join with newlines to preserve user formatting.
+        return "\n".join(self._chunks).strip()
+
+
+def _fetch_clawbot_messages(*, long_poll: bool = False) -> list[dict]:
+    """
+    从 ClawBot 拉取用户发给微信机器人的消息。
+    long_poll=True 时使用10秒长轮询（仅在独立线程中使用）。
+    返回格式统一为 [{"text": str, "msg_id": str, "create_time": str}, ...]
+    仅返回 type=1（文字）消息。
+    """
+    if os.getenv("TP_CLAWBOT_ENABLED", "1").strip() in ("0", "false", "False", "no"):
+        return []
+    ak = _access_key()
+    if not ak:
+        return []
+    headers = {"access-key": ak, "Content-Type": "application/json"}
+    params = {"longPoll": "true"} if long_poll else {}
+    try:
+        resp = requests.get(
+            PUSHPLUS_CLAWBOT_GETMSG,
+            headers=headers,
+            params=params,
+            timeout=15.0 if long_poll else 8.0,
+        )
+        if not resp.ok:
+            return []
+        data = resp.json() or {}
+        if isinstance(data, dict) and data.get("code") not in (200, "200"):
+            return []
+        items = []
+        raw_list = []
+        if isinstance(data, dict):
+            inner = data.get("data")
+            if isinstance(inner, list):
+                raw_list = inner           # data 直接是列表
+            elif isinstance(inner, dict):
+                raw_list = inner.get("list") or []
+            else:
+                raw_list = []
+        # API 返回格式：data 直接是列表，每条消息有 type/text 字段
+        # 也可能是 data.list 嵌套格式，兼容两种
+        if isinstance(raw_list, dict):
+            raw_list = raw_list.get("list") or []
+        for item in (raw_list if isinstance(raw_list, list) else []):
+            if not isinstance(item, dict):
+                continue
+            if int(item.get("type", 0)) != 1:  # 只要文字消息
+                continue
+            text_val = str(item.get("text") or item.get("content") or "").strip()
+            if not text_val:
+                continue
+            # msgId 可能不存在，用 text+type 生成唯一 ID
+            import hashlib as _hl
+            msg_id = str(item.get("msgId") or item.get("id") or "")
+            if not msg_id:
+                msg_id = _hl.md5(f"{item.get('type')}:{text_val}".encode()).hexdigest()
+            items.append({
+                "text": text_val,
+                "msg_id": msg_id,
+                "create_time": str(item.get("createTime") or item.get("sendTime") or ""),
+            })
+        return items
+    except Exception as e:
+        print(f"[clawbot] getMsg exception: {type(e).__name__}: {e}", flush=True)
+        return []
+
+
+def _fetch_message_list(*, current: int = 1, page_size: int = 20) -> list[dict]:
+    ak = _access_key()
+    if not ak:
+        return []
+    headers = {"access-key": ak, "Content-Type": "application/json"}
+    payload = {"current": int(current), "pageSize": min(int(page_size), 50)}
+    resp = requests.post(PUSHPLUS_OPENAPI_LIST, headers=headers, json=payload, timeout=20)
+    if not resp.ok:
+        return []
+    data = resp.json() or {}
+    items: list[Any] = []
+    if isinstance(data, dict):
+        data_obj = data.get("data") or {}
+        if isinstance(data_obj, dict):
+            raw_list = data_obj.get("list") or []
+            if isinstance(raw_list, list):
+                items = raw_list
+    return [x for x in items if isinstance(x, dict)]
+
+
+def _fetch_message_text(short_code: str) -> str:
+    url = PUSHPLUS_SHORT_MESSAGE.format(shortCode=str(short_code).strip())
+    resp = requests.get(url, timeout=20)
+    if not resp.ok:
+        return ""
+    html = resp.text or ""
+    p = _TextExtractor()
+    try:
+        p.feed(html)
+    except Exception:
+        return ""
+    return p.text()
+
+
+def _execute_pending(*, po: PendingOrder, broker, notifier: PushPlusNotifier, source: str) -> None:
+    side = po.side.upper()
+    current_price = get_last_price(broker.quote_ctx, po.symbol)
+    est_amount = float(po.qty) * float(po.limit_price)
+    if est_amount > float(TRADE.max_order_usd):
+        raise RuntimeError(f"Blocked: single order amount ${est_amount:.2f} > max ${TRADE.max_order_usd:.2f}")
+    if side == "BUY":
+        available_cash = broker.get_available_cash()
+        if available_cash < est_amount:
+            raise RuntimeError(f"Blocked: insufficient cash for BUY. cash={available_cash:.2f} need={est_amount:.2f}")
+    else:
+        held_qty = broker.get_position_qty(po.symbol)
+        if held_qty < int(po.qty):
+            raise RuntimeError(f"Blocked: insufficient position for SELL. held={held_qty} need={po.qty}")
+
+    broker.ensure_us_stock_only(po.symbol)
+    broker.ensure_regular_session(po.symbol)
+
+    ok, data = broker.place_limit_order(code=po.symbol, side=side, qty=int(po.qty), price=float(po.limit_price))
+    order_id = _extract_order_id(data) or ""
+    status_msg = ""
+    if order_id:
+        try:
+            qdf = broker.query_order(order_id)
+            if qdf is not None and not qdf.empty:
+                status_msg = str(qdf.iloc[0].get("order_status", ""))
+        except Exception:
+            status_msg = ""
+
+    po.broker_order_id = order_id
+    po.broker_status = status_msg
+    po.updated_at = _now_iso()
+    po.confirm_code = ""  # invalidate immediately
+    po.status = "EXECUTED" if ok else "FAILED"
+    po.message = str(data)
+
+    append_trade_log(
+        {
+            "code": po.symbol,
+            "selected": 1,
+            "action": side,
+            "current_price": current_price,
+            "limit_price": po.limit_price,
+            "qty": po.qty,
+            "est_amount": est_amount,
+            "order_ok": 1 if ok else 0,
+            "order_id": order_id,
+            "order_status": status_msg,
+            "message": f"pushplus source={source}; {data}",
+        }
+    )
+
+    if ok:
+        holdings = load_holdings()
+        if side == "BUY":
+            apply_buy(holdings, symbol=po.symbol, qty=int(po.qty), price=float(po.limit_price))
+        else:
+            apply_sell(holdings, symbol=po.symbol, qty=int(po.qty))
+        save_holdings(holdings)
+        append_trade_record({"ts_utc": _now_iso(), "symbol": po.symbol, "side": side, "qty": int(po.qty), "price": float(po.limit_price), "order_id": order_id})
+
+    notifier.send(
+        title=f"TradePilot 下单结果 {side} {po.symbol}",
+        content=(
+            f"source=pushplus\nsymbol={po.symbol}\nqty={po.qty}\nprice={po.limit_price}\n"
+            f"order_ok={ok}\norder_id={order_id}\nstatus={status_msg}\nmessage={data}"
+        ),
+    )
+
+
+def process_pushplus_confirmations(*, broker, notifier: PushPlusNotifier) -> None:
+    """
+    Pull confirmations from PushPlus OpenAPI (no WeChat desktop listener needed).
+
+    How user confirms:
+    - Send a PushPlus message to yourself with title starting with 'TP_CONFIRM'
+    - Content must be: YES BUY symbol qty confirm_code  (or SELL)
+    """
+    ak = _access_key()
+    if not ak:
+        return
+
+    state = _load_state()
+    processed = set(state.get("processed_shortcodes", []))
+
+    pending_orders = load_pending_orders()
+    changed = False
+    if expire_pending_orders(pending_orders):
+        changed = True
+
+    # Fetch recent messages (first page is usually enough).
+    items = _fetch_message_list(current=1, page_size=20)
+    if not items:
+        return
+
+    # Process newest first by updateTime if present.
+    def _key(x: dict) -> str:
+        return str(x.get("updateTime") or "")
+
+    # Only process very recent TP_CONFIRM to avoid old test messages triggering failures on startup.
+    max_age = int(getattr(TRADE, "confirm_code_expire_seconds", 300)) + 300
+
+    for it in sorted(items, key=_key, reverse=True):
+        title = str(it.get("title") or "").strip()
+        short_code = str(it.get("shortCode") or "").strip()
+        update_time = str(it.get("updateTime") or "").strip()
+        if not short_code or short_code in processed:
+            continue
+        if not title.startswith(TITLE_PREFIX):
+            continue
+        if not _is_recent_message(update_time, max_age_seconds=max_age):
+            # Mark as processed so it won't keep reappearing on every boot.
+            processed.add(short_code)
+            continue
+
+        text = _fetch_message_text(short_code)
+        # PushPlus short message page may include title/header; keep only the first matching command.
+        cmd_line = ""
+        for line in [x.strip() for x in (text or "").splitlines() if x.strip()]:
+            if CMD_RE.match(line):
+                cmd_line = line
+                break
+            # Allow sending only confirm_code for quick confirm
+            if CODE_ONLY_RE.match(line):
+                cmd_line = line
+                break
+
+        if not cmd_line:
+            processed.add(short_code)
+            continue
+
+        m = CMD_RE.match(cmd_line)
+        po: PendingOrder | None = None
+        if m:
+            side, symbol, qty_s, code = m.group(1), m.group(2), m.group(3), m.group(4)
+            po = find_pending_match(pending_orders, side=side, symbol=symbol, qty=int(qty_s), confirm_code=code)
+        else:
+            # Only code: match a single pending order by confirm_code
+            code = cmd_line.strip().upper()
+            matches = [
+                x
+                for x in pending_orders
+                if str(x.status).upper() == "PENDING" and str(x.confirm_code).upper() == code
+            ]
+            if len(matches) == 1:
+                po = matches[0]
+            else:
+                po = None
+
+        if po is None:
+            # Only notify for recent messages; old ones are ignored above.
+            notifier.send(title="TradePilot 确认失败", content=f"source=pushplus\nreason=pending_not_found\ncommand={cmd_line}")
+            processed.add(short_code)
+            continue
+
+        # expiry check
+        try:
+            exp = datetime.strptime(po.expire_time, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            if exp < _utc_now():
+                po.status = "EXPIRED"
+                changed = True
+                notifier.send(title="TradePilot 确认失败", content=f"source=pushplus\nreason=order_expired\nsymbol={po.symbol}")
+                processed.add(short_code)
+                continue
+        except Exception:
+            pass
+
+        try:
+            _execute_pending(po=po, broker=broker, notifier=notifier, source=f"shortCode={short_code}")
+            changed = True
+        except Exception as e:
+            po.status = "FAILED"
+            po.updated_at = _now_iso()
+            po.message = f"pushplus_execute_failed: {type(e).__name__}: {e}"
+            changed = True
+            notifier.send(
+                title="TradePilot 确认执行失败",
+                content=f"source=pushplus\nsymbol={po.symbol}\nside={po.side}\nreason={type(e).__name__}: {e}",
+            )
+
+        processed.add(short_code)
+
+    if changed:
+        save_pending_orders(pending_orders)
+    state["processed_shortcodes"] = list(processed)[-2000:]
+
+    # ── ClawBot：主循环做一次兜底轮询（监听线程是主路径，这里防漏）───────────
+    # 监听线程已通过长轮询实时处理大多数消息；这里只处理线程遗漏的消息。
+    clawbot_msgs = _fetch_clawbot_messages(long_poll=False)
+    for cm in (clawbot_msgs or []):
+        mid = cm.get("msg_id", "")
+        text = cm.get("text", "").strip()
+        if not mid or not text:
+            continue
+        if not _mark_clawbot_seen(mid):
+            continue  # 监听线程已处理
+
+        try:
+            _process_one_clawbot_msg(text, mid, broker=broker, notifier=notifier)
+        except Exception as e:
+            _log.error("[ClawBot fallback] 处理消息异常: %s", e)
+
+    # 把内存去重集合同步回状态文件
+    with _clawbot_seen_lock:
+        ids_snapshot = list(_clawbot_seen_ids)
+    state["clawbot_processed_ids"] = ids_snapshot[-2000:]
+    _save_state(state)
+
+
+# ── 内存中已处理 ClawBot 消息 ID 集合（供监听线程与主循环共享去重）──────────
+_clawbot_seen_lock = threading.Lock()
+_clawbot_seen_ids: set[str] = set()
+
+
+def _mark_clawbot_seen(mid: str) -> bool:
+    """返回 True 表示这条消息是首次见到（可处理）；False 表示已处理过（跳过）。"""
+    with _clawbot_seen_lock:
+        if mid in _clawbot_seen_ids:
+            return False
+        _clawbot_seen_ids.add(mid)
+        # 防止无限增长
+        if len(_clawbot_seen_ids) > 5000:
+            oldest = list(_clawbot_seen_ids)[:500]
+            for x in oldest:
+                _clawbot_seen_ids.discard(x)
+        return True
+
+
+def _process_one_clawbot_msg(text: str, mid: str, *, broker, notifier: PushPlusNotifier) -> None:
+    """处理单条 ClawBot 消息（查询或下单确认）。线程安全。"""
+    text = text.strip()
+    # 尝试匹配下单确认命令
+    cmd_line = ""
+    for line in [x.strip() for x in text.splitlines() if x.strip()]:
+        if CMD_RE.match(line.upper()):
+            cmd_line = line.upper()
+            break
+        if CODE_ONLY_RE.match(line.upper()):
+            cmd_line = line.upper()
+            break
+
+    if not cmd_line:
+        # 除下单确认码外，所有自然语言消息原样交给 Cursor Agent 理解
+        api_key = get_cursor_api_key()
+        if api_key:
+            _enqueue_ai_message(text, mid, broker=broker)
+        else:
+            # 未配置 API Key 时降级到本地规则（并提示配置）
+            handled = _handle_clawbot_query(text, notifier=notifier, broker=broker)
+            if not handled:
+                notifier.send(
+                    title="⚠️ Cursor AI 未启用",
+                    content=(
+                        "请设置环境变量 CURSOR_API_KEY 后重启 TradePilot，\n"
+                        "即可用自然语言远程对话（无需记指令关键词）。\n\n"
+                        "获取地址：https://cursor.com/dashboard/cloud-agents"
+                    ),
+                )
+        return
+
+    # 下单确认
+    pending_orders = load_pending_orders()
+    m = CMD_RE.match(cmd_line)
+    po: PendingOrder | None = None
+    if m:
+        side, symbol, qty_s, code = m.group(1), m.group(2), m.group(3), m.group(4)
+        po = find_pending_match(pending_orders, side=side, symbol=symbol, qty=int(qty_s), confirm_code=code)
+    else:
+        matches = [
+            x for x in pending_orders
+            if str(x.status).upper() == "PENDING" and str(x.confirm_code).upper() == cmd_line
+        ]
+        po = matches[0] if len(matches) == 1 else None
+
+    if po is None:
+        notifier.send(title="TradePilot 确认失败", content=f"source=clawbot\nreason=pending_not_found\ncommand={cmd_line}")
+        return
+
+    try:
+        exp = datetime.strptime(po.expire_time, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        if exp < _utc_now():
+            po.status = "EXPIRED"
+            save_pending_orders(pending_orders)
+            notifier.send(title="TradePilot 确认失败", content=f"source=clawbot\nreason=order_expired\nsymbol={po.symbol}")
+            return
+    except Exception:
+        pass
+
+    try:
+        _execute_pending(po=po, broker=broker, notifier=notifier, source=f"clawbot msg_id={mid}")
+        save_pending_orders(pending_orders)
+    except Exception as e:
+        po.status = "FAILED"
+        po.updated_at = _now_iso()
+        po.message = f"clawbot_execute_failed: {type(e).__name__}: {e}"
+        save_pending_orders(pending_orders)
+        notifier.send(
+            title="TradePilot 确认执行失败",
+            content=f"source=clawbot\nsymbol={po.symbol}\nside={po.side}\nreason={type(e).__name__}: {e}",
+        )
+
+
+# ── ClawBot 长轮询监听线程 ────────────────────────────────────────────────────
+
+_clawbot_listener_started = False
+_clawbot_listener_lock = threading.Lock()
+
+
+def start_clawbot_listener(*, broker, notifier: PushPlusNotifier) -> None:
+    """
+    启动 ClawBot 长轮询监听线程（全局只启动一次）。
+    使用 PushPlus longPoll API：服务器挂起连接直到有新消息，收到立刻处理，
+    响应时间 <5秒，无需等待主循环的 5 分钟轮询窗口。
+    """
+    global _clawbot_listener_started
+    with _clawbot_listener_lock:
+        if _clawbot_listener_started:
+            return
+        _clawbot_listener_started = True
+
+    # 把状态文件里已处理的 ID 预加载到内存，防止重启后重复处理旧消息
+    try:
+        st = _load_state()
+        with _clawbot_seen_lock:
+            _clawbot_seen_ids.update(st.get("clawbot_processed_ids", []))
+    except Exception:
+        pass
+
+    def _listener_loop():
+        _log.info("[ClawBot] 长轮询监听线程已启动")
+        consecutive_errors = 0
+        while True:
+            try:
+                # long_poll=True：服务器最多挂起 ~30s 等待新消息
+                msgs = _fetch_clawbot_messages(long_poll=True)
+                consecutive_errors = 0
+
+                for cm in (msgs or []):
+                    mid = cm.get("msg_id", "")
+                    text = cm.get("text", "").strip()
+                    if not mid or not text:
+                        continue
+                    if not _mark_clawbot_seen(mid):
+                        continue  # 已处理过
+
+                    _log.info("[ClawBot] 收到消息: %s", text[:80])
+                    try:
+                        _process_one_clawbot_msg(text, mid, broker=broker, notifier=notifier)
+                    except Exception as e:
+                        _log.error("[ClawBot] 处理消息异常: %s: %s", type(e).__name__, e)
+
+                    # 持久化已处理 ID（定期写入状态文件）
+                    try:
+                        st = _load_state()
+                        with _clawbot_seen_lock:
+                            ids_snapshot = list(_clawbot_seen_ids)
+                        st["clawbot_processed_ids"] = ids_snapshot[-2000:]
+                        _save_state(st)
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                consecutive_errors += 1
+                wait = min(30 * consecutive_errors, 300)
+                _log.warning("[ClawBot] 长轮询异常（第%d次），%ds 后重试: %s", consecutive_errors, wait, e)
+                time.sleep(wait)
+
+    t = threading.Thread(target=_listener_loop, name="ClawBotListener", daemon=True)
+    t.start()
+
+
+# ── Cursor AI 桥接进程（Node + @cursor/sdk）──────────────────────────────────
+
+_bridge_proc: subprocess.Popen | None = None
+_bridge_lock = threading.Lock()
+
+
+def start_clawbot_bridge_process() -> None:
+    """
+    启动 clawbot_bridge.mjs：从队列读取用户原话 → Cursor Agent → 微信回复。
+    需要 CURSOR_API_KEY 和 node 可用。
+    """
+    global _bridge_proc
+    api_key = get_cursor_api_key()
+    if not api_key:
+        _log.warning("[ClawBot] 未设置 CURSOR_API_KEY，跳过 Cursor AI 桥接")
+        return
+
+    project_root = _project_root()
+    bridge_script = os.path.join(project_root, "clawbot_bridge.mjs")
+    if not os.path.isfile(bridge_script):
+        _log.warning("[ClawBot] 找不到 clawbot_bridge.mjs: %s", bridge_script)
+        return
+
+    node = _find_node_executable()
+    if not node:
+        _log.warning(
+            "[ClawBot] 未找到 node，无法启动 Cursor AI 桥接。"
+            "请安装 Node.js 或设置环境变量 TP_NODE_PATH=node.exe完整路径"
+        )
+        return
+
+    with _bridge_lock:
+        if _bridge_proc is not None and _bridge_proc.poll() is None:
+            return
+
+        env = os.environ.copy()
+        load_secrets_env()
+        env.update({k: v for k, v in os.environ.items() if k.startswith(("CURSOR_", "PUSHPLUS_", "TP_"))})
+        env["TP_AI_QUEUE_PATH"] = _ai_queue_path()
+        env["TP_PROJECT_ROOT"] = project_root
+
+        kwargs: dict = {
+            "cwd": project_root,
+            "env": env,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        try:
+            _bridge_proc = subprocess.Popen([node, bridge_script], **kwargs)
+            _log.info(
+                "[ClawBot] Cursor AI 桥接已启动 pid=%s node=%s queue=%s",
+                _bridge_proc.pid,
+                node,
+                env["TP_AI_QUEUE_PATH"],
+            )
+        except Exception as e:
+            _log.error("[ClawBot] 启动 Cursor AI 桥接失败: %s", e)
+

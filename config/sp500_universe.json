@@ -1,0 +1,14 @@
+{
+  "symbols": [
+    "US.AAPL", "US.MSFT", "US.AMZN", "US.NVDA", "US.GOOGL", "US.META", "US.JPM", "US.JNJ", "US.V", "US.UNH",
+    "US.PG", "US.XOM", "US.CVX", "US.MRK", "US.PFE", "US.WMT", "US.COST", "US.PEP", "US.KO", "US.CSCO",
+    "US.IBM", "US.ORCL", "US.INTC", "US.AMD", "US.COP", "US.SLB", "US.MMM", "US.LOW", "US.TGT", "US.NKE",
+    "US.SBUX", "US.MCD", "US.AMT", "US.NEE", "US.LMT", "US.RTX", "US.DE", "US.BKNG", "US.TMO", "US.ABT",
+    "US.CVS", "US.MDT", "US.CI", "US.HUM", "US.GILD", "US.ISRG", "US.BMY", "US.SCHW", "US.TFC", "US.C",
+    "US.USB", "US.PNC", "US.MET", "US.AIG", "US.ALL", "US.SPGI", "US.BLK", "US.SYK", "US.ZTS", "US.BDX",
+    "US.ELV", "US.REGN", "US.CME", "US.MMC", "US.PGR", "US.ECL", "US.SHW", "US.ICE", "US.NOC", "US.GD",
+    "US.ADP", "US.CSX", "US.NSC", "US.HON", "US.ITW", "US.UPS", "US.FDX", "US.QCOM", "US.TXN", "US.AMAT",
+    "US.LRCX", "US.KLAC", "US.ADI", "US.MU", "US.PANW", "US.CRWD", "US.HUT", "US.MSTR", "US.COIN", "US.PLTR"
+  ],
+  "note": "Fallback universe when Futu plate listing fails; exclude US.VOO in refresh script (CORE)."
+}

@@ -1,0 +1,19 @@
+{
+  "symbols": [
+    "US.BMY",
+    "US.CME",
+    "US.COP",
+    "US.COST",
+    "US.CVX",
+    "US.FDX",
+    "US.HON",
+    "US.JNJ"
+  ],
+  "updated_at": "2026-05-04T12:40:08Z",
+  "source": "refresh_alpha_universe",
+  "plate": "US.SPX500",
+  "top_frac": 0.2,
+  "max_symbols": 35,
+  "input_count": 90,
+  "scored_count": 40
+}
