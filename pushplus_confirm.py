@@ -26,21 +26,54 @@ from notifier import PushPlusNotifier
 from pending_orders import PendingOrder, expire_pending_orders, find_pending_match, load_pending_orders, save_pending_orders
 from report import append_trade_record
 from risk_manager import append_trade_log
-from secrets_loader import get_cursor_api_key, load_secrets_env
+from secrets_loader import get_cursor_api_key, load_secrets_env, resolve_project_root, resolve_runtime_dir
 
 # 支持查询的股票代码正则（US.CRWV 或 CRWV 形式）
 _TICKER_RE = re.compile(r"\b(?:US\.)?([A-Z]{1,6})\b")
 
 # ClawBot → Cursor Agent 消息队列（与 exe 工作目录 logs/ 对齐）
 def _ai_queue_path() -> str:
-    return os.path.join(os.getcwd(), "logs", "clawbot_ai_queue.json")
+    return os.path.join(resolve_runtime_dir(), "logs", "clawbot_ai_queue.json")
 
 
-def _project_root() -> str:
-    cwd = os.path.abspath(os.getcwd())
-    if os.path.basename(cwd).lower() == "dist":
-        return os.path.dirname(cwd)
-    return cwd
+def _clawbot_reply_channel() -> str:
+    """ClawBot 用户发消息的回复渠道（与系统舆情推送的 wechat 分开）。"""
+    return (os.getenv("TP_CLAWBOT_REPLY_CHANNEL") or "clawbot").strip().lower()
+
+
+def _clawbot_send(notifier: PushPlusNotifier, *, title: str, content: str) -> tuple[bool, str]:
+    ch = _clawbot_reply_channel()
+    ok, resp = notifier.send(title=title, content=content, channel=ch)
+    if ok:
+        _log.info("[ClawBot] 已回复 channel=%s title=%s", ch, title[:40])
+    else:
+        _log.warning("[ClawBot] 回复推送失败 channel=%s: %s", ch, str(resp)[:200])
+        fallback = (os.getenv("TP_CLAWBOT_REPLY_FALLBACK") or "").strip().lower()
+        if fallback and fallback != ch:
+            ok2, resp2 = notifier.send(title=title, content=content, channel=fallback)
+            _log.info("[ClawBot] 备用渠道 %s ok=%s", fallback, ok2)
+            if ok2:
+                return ok2, resp2
+    return ok, resp
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if h:
+            k.CloseHandle(h)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def _find_node_executable() -> str | None:
@@ -202,22 +235,51 @@ def _enqueue_ai_message(
                 queue: list = json.load(f) or []
         except Exception:
             queue = []
-        existing_ids = {m.get("msg_id") for m in queue}
-        if msg_id not in existing_ids:
-            queue.append(
-                {
-                    "msg_id": msg_id,
-                    "text": text,
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "status": "pending",
-                    "context": _build_broker_context(broker),
-                }
-            )
-            with open(queue_path, "w", encoding="utf-8") as f:
-                json.dump(queue[-500:], f, ensure_ascii=False, indent=2)
-            _log.info("[ClawBot] 已入队 Cursor AI: %s", text[:80])
+        # 同一 msg_id 可重复入队（例如用户再次发送「pong」），用时间戳区分
+        entry_id = f"{msg_id}_{int(time.time() * 1000)}"
+        queue.append(
+            {
+                "msg_id": entry_id,
+                "text": text,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "status": "pending",
+                "context": _build_broker_context(broker),
+            }
+        )
+        with open(queue_path, "w", encoding="utf-8") as f:
+            json.dump(queue[-500:], f, ensure_ascii=False, indent=2)
+        _log.info("[ClawBot] 已入队 Cursor AI: %s (id=%s)", text[:80], entry_id)
     except Exception as e:
         _log.error("[ClawBot] enqueue_ai_message error: %s", e)
+
+
+def _default_news_tickers(broker=None) -> list[str]:
+    """无股票代码时，用持仓/监控列表作为「新闻」默认标的。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    if broker is not None:
+        try:
+            df = broker.get_positions()
+            if df is not None and not df.empty:
+                for _, row in df.iterrows():
+                    code = str(row.get("code", "")).replace("US.", "").upper()
+                    if code and code not in seen:
+                        seen.add(code)
+                        out.append(code)
+        except Exception:
+            pass
+    if not out:
+        try:
+            from config import TRADE
+
+            for sym in TRADE.symbols:
+                code = str(sym).replace("US.", "").upper()
+                if code and code not in seen:
+                    seen.add(code)
+                    out.append(code)
+        except Exception:
+            pass
+    return out[:5]
 
 
 def _handle_clawbot_query(text: str, *, notifier: PushPlusNotifier, broker=None) -> bool:
@@ -236,7 +298,8 @@ def _handle_clawbot_query(text: str, *, notifier: PushPlusNotifier, broker=None)
 
     # 帮助
     if any(kw in tl for kw in ("帮助", "help", "怎么用", "命令", "指令")):
-        notifier.send(
+        _clawbot_send(
+            notifier,
             title="📖 TradePilot 指令帮助",
             content=(
                 "支持以下查询（直接发送给 ClawBot）：\n\n"
@@ -304,7 +367,7 @@ def _handle_clawbot_query(text: str, *, notifier: PushPlusNotifier, broker=None)
                     lines.append("当前无持仓")
             except Exception:
                 pass
-        notifier.send(title="💰 账户余额", content="\n".join(lines))
+        _clawbot_send(notifier, title="💰 账户余额", content="\n".join(lines))
         return True
 
     # 持仓查询
@@ -358,7 +421,7 @@ def _handle_clawbot_query(text: str, *, notifier: PushPlusNotifier, broker=None)
                     lines.append("本地记录无持仓（broker 未连接，无法读 Futu 实时数据）")
             except Exception as e:
                 lines.append(f"查询持仓失败: {e}")
-        notifier.send(title="📊 持仓查询", content="\n".join(lines))
+        _clawbot_send(notifier, title="📊 持仓查询", content="\n".join(lines))
         return True
 
     # 提取股票代码
@@ -375,6 +438,16 @@ def _handle_clawbot_query(text: str, *, notifier: PushPlusNotifier, broker=None)
     if tickers and (not is_news_query and not is_price_query):
         is_news_query = True
         is_price_query = True
+
+    if not tickers and is_news_query:
+        tickers = _default_news_tickers(broker)
+        if not tickers:
+            _clawbot_send(
+                notifier,
+                title="📰 新闻查询",
+                content="未识别股票代码，且暂无持仓。\n请发：CRWV 新闻  或  CRWV最新消息",
+            )
+            return True
 
     if not tickers:
         return False  # 不是查询，交给确认码处理器
@@ -416,7 +489,7 @@ def _handle_clawbot_query(text: str, *, notifier: PushPlusNotifier, broker=None)
 
     if not out_lines:
         return False
-    notifier.send(title=f"📰 {ticker} 新闻/行情", content="\n".join(out_lines))
+    _clawbot_send(notifier, title=f"📰 {ticker} 新闻/行情", content="\n".join(out_lines))
     return True
 
     return False
@@ -430,7 +503,7 @@ PUSHPLUS_OPENAPI_LIST = "https://www.pushplus.plus/api/open/message/list"
 PUSHPLUS_SHORT_MESSAGE = "https://www.pushplus.plus/shortMessage/{shortCode}"
 PUSHPLUS_CLAWBOT_GETMSG = "https://www.pushplus.plus/api/open/clawBot/getMsg"
 
-STATE_PATH = os.path.join("logs", "pushplus_confirm_state.json")
+STATE_PATH = os.path.join(resolve_runtime_dir(), "logs", "pushplus_confirm_state.json")
 
 # Require title prefix to reduce accidental triggers.
 TITLE_PREFIX = "TP_CONFIRM"
@@ -606,11 +679,13 @@ def _fetch_clawbot_messages(*, long_poll: bool = False) -> list[dict]:
             text_val = str(item.get("text") or item.get("content") or "").strip()
             if not text_val:
                 continue
-            # msgId 可能不存在，用 text+type 生成唯一 ID
+            # msgId 可能不存在：必须带上时间戳，避免「pong」等短句永远被判为重复
             import hashlib as _hl
-            msg_id = str(item.get("msgId") or item.get("id") or "")
+            msg_id = str(item.get("msgId") or item.get("id") or "").strip()
+            create_time = str(item.get("createTime") or item.get("sendTime") or "").strip()
             if not msg_id:
-                msg_id = _hl.md5(f"{item.get('type')}:{text_val}".encode()).hexdigest()
+                seed = f"{item.get('type')}:{text_val}:{create_time or time.time_ns()}"
+                msg_id = _hl.md5(seed.encode("utf-8")).hexdigest()
             items.append({
                 "text": text_val,
                 "msg_id": msg_id,
@@ -717,13 +792,14 @@ def _execute_pending(*, po: PendingOrder, broker, notifier: PushPlusNotifier, so
         save_holdings(holdings)
         append_trade_record({"ts_utc": _now_iso(), "symbol": po.symbol, "side": side, "qty": int(po.qty), "price": float(po.limit_price), "order_id": order_id})
 
-    notifier.send(
-        title=f"TradePilot 下单结果 {side} {po.symbol}",
-        content=(
-            f"source=pushplus\nsymbol={po.symbol}\nqty={po.qty}\nprice={po.limit_price}\n"
-            f"order_ok={ok}\norder_id={order_id}\nstatus={status_msg}\nmessage={data}"
-        ),
+    result_content = (
+        f"source={source}\nsymbol={po.symbol}\nqty={po.qty}\nprice={po.limit_price}\n"
+        f"order_ok={ok}\norder_id={order_id}\nstatus={status_msg}\nmessage={data}"
     )
+    if "clawbot" in str(source).lower():
+        _clawbot_send(notifier, title=f"TradePilot 下单结果 {side} {po.symbol}", content=result_content)
+    else:
+        notifier.send(title=f"TradePilot 下单结果 {side} {po.symbol}", content=result_content)
 
 
 def process_pushplus_confirmations(*, broker, notifier: PushPlusNotifier) -> None:
@@ -898,22 +974,22 @@ def _process_one_clawbot_msg(text: str, mid: str, *, broker, notifier: PushPlusN
             break
 
     if not cmd_line:
-        # 除下单确认码外，所有自然语言消息原样交给 Cursor Agent 理解
+        # 先走本地规则（新闻/持仓/帮助等），秒回 ClawBot；其余再交给 Cursor AI
+        if _handle_clawbot_query(text, notifier=notifier, broker=broker):
+            return
         api_key = get_cursor_api_key()
         if api_key:
             _enqueue_ai_message(text, mid, broker=broker)
         else:
-            # 未配置 API Key 时降级到本地规则（并提示配置）
-            handled = _handle_clawbot_query(text, notifier=notifier, broker=broker)
-            if not handled:
-                notifier.send(
-                    title="⚠️ Cursor AI 未启用",
+            _clawbot_send(
+                notifier,
+                title="⚠️ Cursor AI 未启用",
                     content=(
                         "请设置环境变量 CURSOR_API_KEY 后重启 TradePilot，\n"
                         "即可用自然语言远程对话（无需记指令关键词）。\n\n"
                         "获取地址：https://cursor.com/dashboard/cloud-agents"
                     ),
-                )
+            )
         return
 
     # 下单确认
@@ -931,7 +1007,11 @@ def _process_one_clawbot_msg(text: str, mid: str, *, broker, notifier: PushPlusN
         po = matches[0] if len(matches) == 1 else None
 
     if po is None:
-        notifier.send(title="TradePilot 确认失败", content=f"source=clawbot\nreason=pending_not_found\ncommand={cmd_line}")
+        _clawbot_send(
+            notifier,
+            title="TradePilot 确认失败",
+            content=f"source=clawbot\nreason=pending_not_found\ncommand={cmd_line}",
+        )
         return
 
     try:
@@ -939,7 +1019,11 @@ def _process_one_clawbot_msg(text: str, mid: str, *, broker, notifier: PushPlusN
         if exp < _utc_now():
             po.status = "EXPIRED"
             save_pending_orders(pending_orders)
-            notifier.send(title="TradePilot 确认失败", content=f"source=clawbot\nreason=order_expired\nsymbol={po.symbol}")
+            _clawbot_send(
+                notifier,
+                title="TradePilot 确认失败",
+                content=f"source=clawbot\nreason=order_expired\nsymbol={po.symbol}",
+            )
             return
     except Exception:
         pass
@@ -952,7 +1036,8 @@ def _process_one_clawbot_msg(text: str, mid: str, *, broker, notifier: PushPlusN
         po.updated_at = _now_iso()
         po.message = f"clawbot_execute_failed: {type(e).__name__}: {e}"
         save_pending_orders(pending_orders)
-        notifier.send(
+        _clawbot_send(
+            notifier,
             title="TradePilot 确认执行失败",
             content=f"source=clawbot\nsymbol={po.symbol}\nside={po.side}\nreason={type(e).__name__}: {e}",
         )
@@ -999,9 +1084,10 @@ def start_clawbot_listener(*, broker, notifier: PushPlusNotifier) -> None:
                     if not mid or not text:
                         continue
                     if not _mark_clawbot_seen(mid):
-                        continue  # 已处理过
+                        _log.info("[ClawBot] 跳过已处理消息 id=%s text=%s", mid, text[:60])
+                        continue
 
-                    _log.info("[ClawBot] 收到消息: %s", text[:80])
+                    _log.info("[ClawBot] 收到消息: %s (id=%s)", text[:80], mid)
                     try:
                         _process_one_clawbot_msg(text, mid, broker=broker, notifier=notifier)
                     except Exception as e:
@@ -1044,7 +1130,7 @@ def start_clawbot_bridge_process() -> None:
         _log.warning("[ClawBot] 未设置 CURSOR_API_KEY，跳过 Cursor AI 桥接")
         return
 
-    project_root = _project_root()
+    project_root = resolve_project_root()
     bridge_script = os.path.join(project_root, "clawbot_bridge.mjs")
     if not os.path.isfile(bridge_script):
         _log.warning("[ClawBot] 找不到 clawbot_bridge.mjs: %s", bridge_script)
@@ -1062,9 +1148,25 @@ def start_clawbot_bridge_process() -> None:
         if _bridge_proc is not None and _bridge_proc.poll() is None:
             return
 
+        lock_path = os.path.join(os.path.dirname(_ai_queue_path()), "clawbot_bridge.lock")
+        if os.path.isfile(lock_path):
+            try:
+                with open(lock_path, encoding="utf-8") as f:
+                    pid = int(f.read().strip())
+                if _pid_alive(pid):
+                    _log.info(
+                        "[ClawBot] 桥接已在运行 (pid=%s)，跳过重复启动",
+                        pid,
+                    )
+                    return
+            except (ValueError, OSError):
+                pass
+
         env = os.environ.copy()
         load_secrets_env()
         env.update({k: v for k, v in os.environ.items() if k.startswith(("CURSOR_", "PUSHPLUS_", "TP_"))})
+        if not env.get("TP_CLAWBOT_REPLY_CHANNEL"):
+            env["TP_CLAWBOT_REPLY_CHANNEL"] = "clawbot"
         env["TP_AI_QUEUE_PATH"] = _ai_queue_path()
         env["TP_PROJECT_ROOT"] = project_root
 

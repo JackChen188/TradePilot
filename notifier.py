@@ -17,14 +17,22 @@ class PushPlusNotifier:
     def enabled(self) -> bool:
         return bool(self._token())
 
-    def send(self, *, title: str, content: str, timeout: float = 20.0) -> tuple[bool, str]:
+    def send(
+        self,
+        *,
+        title: str,
+        content: str,
+        timeout: float = 20.0,
+        channel: str | None = None,
+    ) -> tuple[bool, str]:
         token = self._token()
         if not token:
             return False, f"PushPlus token missing in env: {self.token_env}"
 
-        # 渠道优先级：环境变量 TP_PUSHPLUS_CHANNEL（默认空，走 PushPlus 默认渠道）
-        # 设置为 "clawbot" 时消息将通过微信 ClawBot 推送到微信
-        channel = (os.getenv("TP_PUSHPLUS_CHANNEL") or "").strip().lower()
+        # channel 参数优先；否则 TP_PUSHPLUS_CHANNEL（支持逗号多通道，如 clawbot,wechat）
+        channel = (channel or os.getenv("TP_PUSHPLUS_CHANNEL") or "").strip()
+        if channel:
+            channel = ",".join(c.strip().lower() for c in channel.split(",") if c.strip())
 
         payload: dict = {
             "token": token,
@@ -37,7 +45,16 @@ class PushPlusNotifier:
 
         try:
             resp = requests.post(self.api_url, json=payload, timeout=float(timeout))
-            return resp.ok, resp.text
+            text = resp.text or ""
+            if not resp.ok:
+                return False, text
+            try:
+                data = resp.json()
+                if isinstance(data, dict) and data.get("code") not in (200, "200"):
+                    return False, text
+            except Exception:
+                pass
+            return True, text
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"
 
