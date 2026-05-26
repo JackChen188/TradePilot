@@ -628,7 +628,12 @@ PUSHPLUS_TOKEN_ENV = "PUSHPLUS_TOKEN"  # user token (NOT message token)
 PUSHPLUS_GET_ACCESS_KEY = "https://www.pushplus.plus/api/common/openApi/getAccessKey"
 PUSHPLUS_OPENAPI_LIST = "https://www.pushplus.plus/api/open/message/list"
 PUSHPLUS_SHORT_MESSAGE = "https://www.pushplus.plus/shortMessage/{shortCode}"
-PUSHPLUS_CLAWBOT_GETMSG = "https://www.pushplus.plus/api/open/clawBot/getMsg"
+PUSHPLUS_CLAWBOT_GETMSG_PATH = "/api/open/clawBot/getMsg"
+PUSHPLUS_CLAWBOT_GETMSG = "https://www.pushplus.plus" + PUSHPLUS_CLAWBOT_GETMSG_PATH
+_PUSHPLUS_API_BASES = (
+    "https://www.pushplus.plus",
+    "http://www.pushplus.plus",
+)
 
 STATE_PATH = os.path.join(resolve_runtime_dir(), "logs", "pushplus_confirm_state.json")
 
@@ -781,11 +786,73 @@ class _TextExtractor(HTMLParser):
         return "\n".join(self._chunks).strip()
 
 
-def _fetch_clawbot_messages(*, long_poll: bool = False) -> list[dict]:
+def _pushplus_http_timeout(*, long_poll: bool) -> tuple[float, float]:
+    """(connect_timeout, read_timeout) — 长轮询 read 需大于服务端挂起时间（约 30s）。"""
+    connect = float(os.getenv("TP_PUSHPLUS_CONNECT_TIMEOUT", "25"))
+    if long_poll:
+        # PushPlus longPoll 服务端可挂起 ~30s；读超时过短会误报 ReadTimeout
+        read = float(os.getenv("TP_CLAWBOT_LONG_POLL_READ_TIMEOUT", "60"))
+    else:
+        read = float(os.getenv("TP_PUSHPLUS_READ_TIMEOUT", "30"))
+    return connect, read
+
+
+def _pushplus_api_bases() -> list[str]:
+    override = (os.getenv("TP_PUSHPLUS_API_BASE") or "").strip().rstrip("/")
+    if override:
+        return [override]
+    return list(_PUSHPLUS_API_BASES)
+
+
+def _pushplus_get_json(
+    path: str,
+    *,
+    headers: dict,
+    params: dict | None = None,
+    long_poll: bool = False,
+) -> dict | None:
+    """GET PushPlus OpenAPI，连接失败时重试并尝试 http/https。"""
+    params = params or {}
+    timeout = _pushplus_http_timeout(long_poll=long_poll)
+    retries = max(1, int(os.getenv("TP_PUSHPLUS_HTTP_RETRIES", "3")))
+    last_err: Exception | None = None
+    bases = _pushplus_api_bases()
+    for attempt in range(retries):
+        for base in bases:
+            url = f"{base}{path}"
+            try:
+                resp = requests.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                    timeout=timeout,
+                )
+                if not resp.ok:
+                    last_err = RuntimeError(f"HTTP {resp.status_code}")
+                    continue
+                data = resp.json() if resp.text else {}
+                return data if isinstance(data, dict) else {}
+            except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError) as e:
+                last_err = e
+            except requests.exceptions.ReadTimeout as e:
+                # 长轮询读超时：服务端挂起后无新消息，属正常情况
+                if long_poll:
+                    return {"code": 200, "data": []}
+                last_err = e
+            except Exception as e:
+                last_err = e
+        if attempt < retries - 1:
+            time.sleep(min(2**attempt, 6))
+    if last_err is not None:
+        raise last_err
+    return None
+
+
+def _fetch_clawbot_messages(*, long_poll: bool = False) -> list[dict] | None:
     """
     从 ClawBot 拉取用户发给微信机器人的消息。
-    long_poll=True 时使用10秒长轮询（仅在独立线程中使用）。
-    返回格式统一为 [{"text": str, "msg_id": str, "create_time": str}, ...]
+    long_poll=True 时使用长轮询（仅在独立线程中使用）。
+    返回 [{"text", "msg_id", "create_time"}, ...]；网络/API 失败返回 None（与「无新消息」区分）。
     仅返回 type=1（文字）消息。
     """
     if os.getenv("TP_CLAWBOT_ENABLED", "1").strip() in ("0", "false", "False", "no"):
@@ -796,17 +863,17 @@ def _fetch_clawbot_messages(*, long_poll: bool = False) -> list[dict]:
     headers = {"access-key": ak, "Content-Type": "application/json"}
     params = {"longPoll": "true"} if long_poll else {}
     try:
-        resp = requests.get(
-            PUSHPLUS_CLAWBOT_GETMSG,
+        data = _pushplus_get_json(
+            PUSHPLUS_CLAWBOT_GETMSG_PATH,
             headers=headers,
             params=params,
-            timeout=15.0 if long_poll else 8.0,
+            long_poll=long_poll,
         )
-        if not resp.ok:
-            return []
-        data = resp.json() or {}
-        if isinstance(data, dict) and data.get("code") not in (200, "200"):
-            return []
+        if data is None:
+            return None
+        if data.get("code") not in (200, "200"):
+            _log.warning("[ClawBot] getMsg API 拒绝: %s", str(data)[:200])
+            return None
         items = []
         raw_list = []
         if isinstance(data, dict):
@@ -842,9 +909,17 @@ def _fetch_clawbot_messages(*, long_poll: bool = False) -> list[dict]:
                 "create_time": str(item.get("createTime") or item.get("sendTime") or ""),
             })
         return items
-    except Exception as e:
+    except requests.exceptions.ReadTimeout as e:
+        if long_poll:
+            _log.debug("[ClawBot] getMsg 长轮询读超时（无新消息）: %s", e)
+            return []
+        _log.warning("[ClawBot] getMsg 读超时: %s", e)
         print(f"[clawbot] getMsg exception: {type(e).__name__}: {e}", flush=True)
-        return []
+        return None
+    except Exception as e:
+        _log.warning("[ClawBot] getMsg 异常: %s: %s", type(e).__name__, e)
+        print(f"[clawbot] getMsg exception: {type(e).__name__}: {e}", flush=True)
+        return None
 
 
 def _fetch_message_list(*, current: int = 1, page_size: int = 20) -> list[dict]:
@@ -1062,7 +1137,9 @@ def process_pushplus_confirmations(*, broker, notifier: PushPlusNotifier) -> Non
     # ── ClawBot：主循环做一次兜底轮询（监听线程是主路径，这里防漏）───────────
     # 监听线程已通过长轮询实时处理大多数消息；这里只处理线程遗漏的消息。
     clawbot_msgs = _fetch_clawbot_messages(long_poll=False)
-    for cm in (clawbot_msgs or []):
+    if clawbot_msgs is None:
+        clawbot_msgs = []
+    for cm in clawbot_msgs:
         mid = cm.get("msg_id", "")
         text = cm.get("text", "").strip()
         if not mid or not text:
@@ -1140,10 +1217,16 @@ def _process_one_clawbot_msg(text: str, mid: str, *, broker, notifier: PushPlusN
         po = matches[0] if len(matches) == 1 else None
 
     if po is None:
+        pending_n = sum(1 for x in pending_orders if str(x.status).upper() == "PENDING")
         _clawbot_send(
             notifier,
             title="TradePilot 确认失败",
-            content=f"source=clawbot\nreason=pending_not_found\ncommand={cmd_line}",
+            content=(
+                f"source=clawbot\nreason=pending_not_found\ncommand={cmd_line}\n"
+                f"当前待确认订单数: {pending_n}\n"
+                "请先在 PushPlus/微信收到 BUY 信号推送后，用该单上的 confirm_code 确认；"
+                "若从未收到信号单，说明当时没有待确认订单或已过期。"
+            ),
         )
         return
 
@@ -1209,9 +1292,20 @@ def start_clawbot_listener(*, broker, notifier: PushPlusNotifier) -> None:
             try:
                 # long_poll=True：服务器最多挂起 ~30s 等待新消息
                 msgs = _fetch_clawbot_messages(long_poll=True)
+                if msgs is None:
+                    consecutive_errors += 1
+                    wait = min(30 * consecutive_errors, 300)
+                    _log.warning(
+                        "[ClawBot] getMsg 失败（第%d次），%ds 后重试；"
+                        "可增大 TP_CLAWBOT_LONG_POLL_READ_TIMEOUT（默认60s）",
+                        consecutive_errors,
+                        wait,
+                    )
+                    time.sleep(wait)
+                    continue
                 consecutive_errors = 0
 
-                for cm in (msgs or []):
+                for cm in msgs:
                     mid = cm.get("msg_id", "")
                     text = cm.get("text", "").strip()
                     if not mid or not text:
