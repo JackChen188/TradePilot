@@ -30,6 +30,7 @@ from secrets_loader import get_cursor_api_key, load_secrets_env, resolve_project
 
 # 支持查询的股票代码正则（US.CRWV 或 CRWV 形式）
 _TICKER_RE = re.compile(r"\b(?:US\.)?([A-Z]{1,6})\b")
+_STRATEGY_SIGNAL_RE = re.compile(r"signal\s*=\s*(BUY|SELL|HOLD)", re.I)
 
 # ClawBot → Cursor Agent 消息队列（与 exe 工作目录 logs/ 对齐）
 def _ai_queue_path() -> str:
@@ -282,6 +283,111 @@ def _default_news_tickers(broker=None) -> list[str]:
     return out[:5]
 
 
+def _is_tradepilot_signal_line(text: str) -> bool:
+    """TradePilot 控制台/推送里的策略扫描一行（勿当作「查新闻」）。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    tl = t.lower()
+    if _STRATEGY_SIGNAL_RE.search(t) and ("score=" in tl or "rank=" in tl):
+        return True
+    if "buy signal:" in tl or "sell signal:" in tl:
+        return True
+    return False
+
+
+def _parse_signal_line_ticker(text: str) -> str:
+    m = re.search(r"\bUS\.([A-Z]{1,6})\b", text, re.I)
+    if m:
+        return m.group(1).upper()
+    m2 = re.match(r"^\s*([A-Z]{1,6})\s+signal\s*=", text.strip(), re.I)
+    if m2:
+        return m2.group(1).upper()
+    return "未知"
+
+
+def _plain_score_clause(clause: str) -> str:
+    c = clause.strip()
+    if not c:
+        return ""
+    known = {
+        "SPY>MA200(+20)": "大盘：SPY 在 200 日均线上方（整体偏多环境，+20 分）",
+        "price>MA200(+20)": "个股：价格在 200 日均线上方（长期趋势偏多，+20 分；本条若未出现表示未满足）",
+        "MA20>MA60(+20)": "个股：20 日均线在 60 日均线上方（短期趋势向上，+20 分）",
+        "ret63 rank top(+20)": "动量：近 63 日涨幅在当次扫描池中排名靠前（+20 分）",
+        "ret5d in[-6%,+4%](+10)": "节奏：近 5 日涨跌幅在 -6%～+4%（避免短期过热/暴跌，+10 分）",
+        "RSI bypass(+10)": "RSI 规则放宽（白名单标的，+10 分）",
+    }
+    if c in known:
+        return known[c]
+    m = re.match(r"RSI14 in\[45,(\d+)\]\(\+10\)", c, re.I)
+    if m:
+        hi = m.group(1)
+        return f"RSI：14 日 RSI 在 45～{hi} 之间（有动能但未过热，+10 分）"
+    m2 = re.match(r"RSI14 strong-exception<=(\d+)\(\+10\)", c, re.I)
+    if m2:
+        return f"RSI：强势例外，RSI≤{m2.group(1)} 仍可加分（+10 分）"
+    return c.replace("(+", "（+").replace(")", " 分）")
+
+
+def _explain_tradepilot_signal_line(text: str) -> str:
+    """把 main.py 打印的 signal= 一行翻成中文说明。"""
+    ticker = _parse_signal_line_ticker(text)
+    sig_m = _STRATEGY_SIGNAL_RE.search(text)
+    score_m = re.search(r"score\s*=\s*(\d+)", text, re.I)
+    rank_m = re.search(r"rank\s*=\s*([\d.]+)\s*%", text, re.I)
+
+    lines: list[str] = [
+        f"【US.{ticker} 策略信号解读】",
+        "",
+        "这是 TradePilot 扫描结果摘要，不是已经下单；BUY 仅表示「符合买入评分」，是否买入还需 PushPlus 确认。",
+        "",
+    ]
+    if sig_m:
+        sig = sig_m.group(1).upper()
+        if sig == "BUY":
+            lines.append("signal=BUY：达到买入评分线（默认 score≥60），可考虑纳入候选。")
+        elif sig == "SELL":
+            lines.append("signal=SELL：技术面转弱或触发卖出规则。")
+        else:
+            lines.append(f"signal={sig}：暂不买入也不卖出。")
+    if score_m:
+        sc = int(score_m.group(1))
+        lines.append(f"score={sc}：技术面总分（约 100 分制），≥60 才给 BUY；你这条共 {sc} 分。")
+    if rank_m:
+        rp = float(rank_m.group(1))
+        lines.append(
+            f"rank={rp:.1f}%：近 63 日涨幅在本次扫描股票池中的相对位置，"
+            f"约强于池中 {rp:.0f}% 的标的（越高动量越强）。"
+        )
+
+    reason_raw = text.split("|", 1)[-1].strip() if "|" in text else ""
+    reason_raw = re.sub(r"^(BUY|SELL)\s+signal:\s*", "", reason_raw, flags=re.I).strip()
+    if reason_raw:
+        lines.extend(["", "【得分明细】"])
+        for part in reason_raw.split("&"):
+            plain = _plain_score_clause(part.strip())
+            if plain:
+                lines.append(f"  · {plain}")
+
+    if score_m and int(score_m.group(1)) < 90:
+        lines.extend(
+            [
+                "",
+                "【提示】",
+                "  · 若明细里没有 price>MA200(+20)，说明股价可能仍低于自身 200 日线；",
+                "  · 满足该项时总分往往会更高（常见 90 分左右）。",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "其他自然语言问题（非粘贴 signal= 日志）会交给 Cursor AI 回答。",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _handle_clawbot_query(text: str, *, notifier: PushPlusNotifier, broker=None) -> bool:
     """
     尝试将用户消息识别为查询请求并回复。
@@ -295,6 +401,22 @@ def _handle_clawbot_query(text: str, *, notifier: PushPlusNotifier, broker=None)
     """
     t = text.strip()
     tl = t.lower()
+
+    # 含 YES BUY/SELL 确认命令时交给下单逻辑，勿当作新闻/行情查询
+    if _extract_confirm_cmd_line(t):
+        return False
+
+    # TradePilot 策略扫描一行 / 用户粘贴 signal= 日志求解释（勿误判为查新闻）
+    if _is_tradepilot_signal_line(t) or (
+        any(k in t for k in ("什么意思", "解释一下", "帮我解释", "啥意思", "怎么理解"))
+        and _STRATEGY_SIGNAL_RE.search(t)
+    ):
+        _clawbot_send(
+            notifier,
+            title=f"📊 {_parse_signal_line_ticker(t)} 信号解读",
+            content=_explain_tradepilot_signal_line(t),
+        )
+        return True
 
     # 帮助
     if any(kw in tl for kw in ("帮助", "help", "怎么用", "命令", "指令")):
@@ -311,12 +433,17 @@ def _handle_clawbot_query(text: str, *, notifier: PushPlusNotifier, broker=None)
                 "【新闻查询】\n"
                 "  CRWV最新消息\n"
                 "  有关VOO的新闻吗\n\n"
+                "【策略信号解读】\n"
+                "  粘贴控制台一行：US.ZS signal=BUY score=70 ...\n\n"
+                "【AI 对话】\n"
+                "  其他自然语言（非上述格式）会交给 Cursor AI\n\n"
                 "【价格查询】\n"
                 "  CRWV现在多少\n"
                 "  TQQQ价格\n\n"
                 "【确认下单】\n"
-                "  直接发 confirm_code（如 A3F9）\n"
-                "  或完整格式：YES BUY US.VOO 1 A3F9"
+                "  YES BUY US.VOO 1 A3F9\n"
+                "  或：确认下单 YES BUY US.VOO 1 A3F9\n"
+                "  或只发确认码：A3F9"
             ),
         )
         return True
@@ -433,9 +560,9 @@ def _handle_clawbot_query(text: str, *, notifier: PushPlusNotifier, broker=None)
     is_news_query = any(kw in tl for kw in ("新闻", "消息", "最新", "怎么样", "如何", "有没有", "动态", "公告", "news"))
     is_price_query = any(kw in tl for kw in ("价格", "多少", "现在", "涨", "跌", "price", "quote", "行情"))
 
-    # 只要提到股票代码（比如“CRWV”），即使没有显式关键词，也默认给出「价格 + 最新新闻摘要」，
-    # 避免用户必须记指令关键词。
-    if tickers and (not is_news_query and not is_price_query):
+    # 只要提到股票代码（比如“CRWV”），即使没有显式关键词，也默认给出「价格 + 最新新闻摘要」。
+    # 但 TradePilot 策略日志行（含 signal=/score=）不要误判为查新闻。
+    if tickers and (not is_news_query and not is_price_query) and not _is_tradepilot_signal_line(t):
         is_news_query = True
         is_price_query = True
 
@@ -509,7 +636,30 @@ STATE_PATH = os.path.join(resolve_runtime_dir(), "logs", "pushplus_confirm_state
 TITLE_PREFIX = "TP_CONFIRM"
 
 CMD_RE = re.compile(r"^YES\s+(BUY|SELL)\s+([A-Z]{2}\.[A-Z0-9]+)\s+(\d+)\s+([A-Z0-9]{4,16})$")
+_CONFIRM_EMBEDDED_RE = re.compile(
+    r"YES\s+(BUY|SELL)\s+([A-Z]{2}\.[A-Z0-9]+)\s+(\d+)\s+([A-Z0-9]{4,16})",
+    re.I,
+)
 CODE_ONLY_RE = re.compile(r"^[A-Z0-9]{4,16}$")
+
+
+def _extract_confirm_cmd_line(text: str) -> str:
+    """
+    从 ClawBot/PushPlus 消息中提取下单确认命令。
+    支持整行 YES BUY ...，以及「确认下单 YES BUY ...」等带前缀的写法。
+    """
+    for line in [x.strip() for x in (text or "").splitlines() if x.strip()]:
+        u = line.strip().upper()
+        u = re.sub(r"^确认下单\s*", "", u)
+        u = re.sub(r"^CONFIRM\s+", "", u)
+        if CMD_RE.match(u):
+            return u
+        m = _CONFIRM_EMBEDDED_RE.search(u)
+        if m:
+            return m.group(0).upper()
+        if CODE_ONLY_RE.match(u):
+            return u
+    return ""
 
 _PUSHPLUS_TIME_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -848,16 +998,7 @@ def process_pushplus_confirmations(*, broker, notifier: PushPlusNotifier) -> Non
             continue
 
         text = _fetch_message_text(short_code)
-        # PushPlus short message page may include title/header; keep only the first matching command.
-        cmd_line = ""
-        for line in [x.strip() for x in (text or "").splitlines() if x.strip()]:
-            if CMD_RE.match(line):
-                cmd_line = line
-                break
-            # Allow sending only confirm_code for quick confirm
-            if CODE_ONLY_RE.match(line):
-                cmd_line = line
-                break
+        cmd_line = _extract_confirm_cmd_line(text or "")
 
         if not cmd_line:
             processed.add(short_code)
@@ -963,15 +1104,7 @@ def _mark_clawbot_seen(mid: str) -> bool:
 def _process_one_clawbot_msg(text: str, mid: str, *, broker, notifier: PushPlusNotifier) -> None:
     """处理单条 ClawBot 消息（查询或下单确认）。线程安全。"""
     text = text.strip()
-    # 尝试匹配下单确认命令
-    cmd_line = ""
-    for line in [x.strip() for x in text.splitlines() if x.strip()]:
-        if CMD_RE.match(line.upper()):
-            cmd_line = line.upper()
-            break
-        if CODE_ONLY_RE.match(line.upper()):
-            cmd_line = line.upper()
-            break
+    cmd_line = _extract_confirm_cmd_line(text)
 
     if not cmd_line:
         # 先走本地规则（新闻/持仓/帮助等），秒回 ClawBot；其余再交给 Cursor AI
