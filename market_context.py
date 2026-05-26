@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
 import textwrap
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -10,6 +13,8 @@ from datetime import datetime
 from typing import Any
 
 import requests
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -293,7 +298,47 @@ def extract_impact_titles(news: NewsSummary) -> list[str]:
 
 
 _translate_cache: dict[str, str] = {}
-_TRANSLATE_CACHE_MAX = 500
+_translate_cache_loaded = False
+_TRANSLATE_CACHE_MAX = 2000
+
+
+def _translate_cache_path() -> str:
+    try:
+        from secrets_loader import resolve_runtime_dir
+
+        base = resolve_runtime_dir()
+    except Exception:
+        base = os.getcwd()
+    return os.path.join(base, "logs", "news_translate_cache.json")
+
+
+def _load_translate_cache() -> None:
+    global _translate_cache_loaded
+    if _translate_cache_loaded:
+        return
+    _translate_cache_loaded = True
+    path = _translate_cache_path()
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if isinstance(k, str) and isinstance(v, str) and v.strip():
+                        _translate_cache[k] = v.strip()
+    except Exception as e:
+        _log.debug("news translate cache load failed: %s", e)
+
+
+def _save_translate_cache() -> None:
+    path = _translate_cache_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        items = list(_translate_cache.items())[-_TRANSLATE_CACHE_MAX:]
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(dict(items), f, ensure_ascii=False)
+    except Exception as e:
+        _log.debug("news translate cache save failed: %s", e)
 
 
 def _needs_zh_translation(text: str) -> bool:
@@ -307,21 +352,7 @@ def _needs_zh_translation(text: str) -> bool:
     return latin >= 8
 
 
-def translate_to_zh(text: str, *, timeout_s: float | None = None) -> str:
-    """
-    Best-effort EN→ZH for RSS headlines (MyMemory, no API key).
-    Returns empty string if disabled, already Chinese, or on failure.
-    """
-    if os.getenv("TP_NEWS_TRANSLATE_ENABLED", "1").strip() in ("0", "false", "False", "no", "NO"):
-        return ""
-    key = re.sub(r"\s+", " ", (text or "").strip())
-    if not key or not _needs_zh_translation(key):
-        return ""
-    cached = _translate_cache.get(key)
-    if cached:
-        return cached
-    if timeout_s is None:
-        timeout_s = float(os.getenv("TP_NEWS_TRANSLATE_TIMEOUT", "5"))
+def _translate_via_mymemory(key: str, *, timeout_s: float) -> str:
     try:
         q = urllib.parse.quote(key[:500])
         url = f"https://api.mymemory.translated.net/get?q={q}&langpair=en|zh-CN"
@@ -329,25 +360,86 @@ def translate_to_zh(text: str, *, timeout_s: float | None = None) -> str:
         if r.status_code != 200:
             return ""
         data = r.json() if r.text else {}
-        if not isinstance(data, dict) or data.get("responseStatus") != 200:
+        if not isinstance(data, dict):
+            return ""
+        details = str(data.get("responseDetails") or "")
+        if "MYMEMORY WARNING" in details.upper():
+            return ""
+        if data.get("responseStatus") != 200:
             return ""
         zh = str((data.get("responseData") or {}).get("translatedText") or "").strip()
         if not zh or zh.lower() == key.lower():
             return ""
-        if len(_translate_cache) >= _TRANSLATE_CACHE_MAX:
-            try:
-                _translate_cache.pop(next(iter(_translate_cache)))
-            except StopIteration:
-                pass
-        _translate_cache[key] = zh
         return zh
     except Exception:
         return ""
 
 
+def _translate_via_google_gtx(key: str, *, timeout_s: float) -> str:
+    """Fallback when MyMemory is rate-limited or unreachable."""
+    try:
+        r = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": "en", "tl": "zh-CN", "dt": "t", "q": key[:500]},
+            timeout=float(timeout_s),
+            headers={"User-Agent": "TradePilot/1.0"},
+        )
+        if r.status_code != 200:
+            return ""
+        data = r.json()
+        if not isinstance(data, list) or not data or not isinstance(data[0], list):
+            return ""
+        parts = [str(p[0]) for p in data[0] if isinstance(p, list) and p and p[0]]
+        zh = "".join(parts).strip()
+        if not zh or zh.lower() == key.lower():
+            return ""
+        return zh
+    except Exception:
+        return ""
+
+
+def translate_to_zh(text: str, *, timeout_s: float | None = None) -> str:
+    """
+    Best-effort EN→ZH for RSS headlines (MyMemory + Google gtx fallback, no API key).
+    Returns empty string if disabled, already Chinese, or on failure.
+    """
+    if os.getenv("TP_NEWS_TRANSLATE_ENABLED", "1").strip() in ("0", "false", "False", "no", "NO"):
+        return ""
+    _load_translate_cache()
+    key = re.sub(r"\s+", " ", (text or "").strip())
+    if not key or not _needs_zh_translation(key):
+        return ""
+    cached = _translate_cache.get(key)
+    if cached:
+        return cached
+    if timeout_s is None:
+        timeout_s = float(os.getenv("TP_NEWS_TRANSLATE_TIMEOUT", "8"))
+
+    zh = _translate_via_mymemory(key, timeout_s=float(timeout_s))
+    if not zh:
+        time.sleep(0.15)
+        zh = _translate_via_mymemory(key, timeout_s=float(timeout_s))
+    if not zh:
+        zh = _translate_via_google_gtx(key, timeout_s=float(timeout_s))
+
+    if not zh:
+        _log.info("[NEWS] 标题翻译失败: %s", key[:80])
+        return ""
+
+    if len(_translate_cache) >= _TRANSLATE_CACHE_MAX:
+        try:
+            _translate_cache.pop(next(iter(_translate_cache)))
+        except StopIteration:
+            pass
+    _translate_cache[key] = zh
+    _save_translate_cache()
+    return zh
+
+
 def format_news_title_lines(titles: list[str], *, max_items: int = 5) -> list[str]:
     """Format headlines for push: English title + Chinese translation when available."""
     lines: list[str] = []
+    translated = 0
     for i, t in enumerate((titles or [])[: int(max_items)], 1):
         title = re.sub(r"\s+", " ", str(t).strip())
         if not title:
@@ -356,6 +448,12 @@ def format_news_title_lines(titles: list[str], *, max_items: int = 5) -> list[st
         lines.append(f"{i}. {title}")
         if zh:
             lines.append(f"   译：{zh}")
+            translated += 1
+        elif _needs_zh_translation(title):
+            time.sleep(0.12)
+    need = sum(1 for t in (titles or [])[: int(max_items)] if _needs_zh_translation(str(t)))
+    if need > 0 and translated == 0:
+        _log.warning("[NEWS] 本批 %d 条英文标题均未译出中文，请检查网络或翻译服务", need)
     return lines
 
 
