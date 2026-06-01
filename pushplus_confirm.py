@@ -418,6 +418,15 @@ def _handle_clawbot_query(text: str, *, notifier: PushPlusNotifier, broker=None)
         )
         return True
 
+    # 连通性自检（秒回，不依赖 Cursor AI）
+    if t in ("测试", "ping", "PING", "连通", "连通测试"):
+        _clawbot_send(
+            notifier,
+            title="✅ ClawBot 连通正常",
+            content="TradePilot 已收到你的消息并回复。\n发「帮助」查看指令。",
+        )
+        return True
+
     # 帮助
     if any(kw in tl for kw in ("帮助", "help", "怎么用", "命令", "指令")):
         _clawbot_send(
@@ -630,10 +639,9 @@ PUSHPLUS_OPENAPI_LIST = "https://www.pushplus.plus/api/open/message/list"
 PUSHPLUS_SHORT_MESSAGE = "https://www.pushplus.plus/shortMessage/{shortCode}"
 PUSHPLUS_CLAWBOT_GETMSG_PATH = "/api/open/clawBot/getMsg"
 PUSHPLUS_CLAWBOT_GETMSG = "https://www.pushplus.plus" + PUSHPLUS_CLAWBOT_GETMSG_PATH
-_PUSHPLUS_API_BASES = (
-    "https://www.pushplus.plus",
-    "http://www.pushplus.plus",
-)
+# 默认只用 www（多数网络可解析）；pushplus.plus 无 www 在部分路由器 DNS 会超时。
+_PUSHPLUS_API_BASES_HTTPS = ("https://www.pushplus.plus",)
+_pushplus_dns_warn_ts: float = 0.0
 
 STATE_PATH = os.path.join(resolve_runtime_dir(), "logs", "pushplus_confirm_state.json")
 
@@ -797,11 +805,45 @@ def _pushplus_http_timeout(*, long_poll: bool) -> tuple[float, float]:
     return connect, read
 
 
+def _is_pushplus_dns_error(err: Exception) -> bool:
+    s = str(err).lower()
+    return (
+        "getaddrinfo failed" in s
+        or "failed to resolve" in s
+        or "name resolution" in s
+        or "nodename nor servname" in s
+        or "name or service not known" in s
+    )
+
+
+def _log_pushplus_network_error(err: Exception) -> None:
+    global _pushplus_dns_warn_ts
+    now = time.time()
+    if _is_pushplus_dns_error(err):
+        if now - _pushplus_dns_warn_ts < 300:
+            return
+        _pushplus_dns_warn_ts = now
+        _log.warning(
+            "[ClawBot] 无法解析 pushplus 域名（DNS/网络），ClawBot 收消息会暂停；"
+            "请检查本机 DNS、代理、防火墙，或设置 TP_PUSHPLUS_API_BASE"
+        )
+        return
+    _log.warning("[ClawBot] getMsg 网络异常: %s: %s", type(err).__name__, err)
+
+
 def _pushplus_api_bases() -> list[str]:
     override = (os.getenv("TP_PUSHPLUS_API_BASE") or "").strip().rstrip("/")
     if override:
         return [override]
-    return list(_PUSHPLUS_API_BASES)
+    bases = list(_PUSHPLUS_API_BASES_HTTPS)
+    alt = (os.getenv("TP_PUSHPLUS_ALT_BASE") or "").strip().rstrip("/")
+    if alt and alt not in bases:
+        bases.append(alt)
+    if (os.getenv("TP_PUSHPLUS_ALLOW_HTTP") or "").strip().lower() in ("1", "true", "yes"):
+        for b in list(bases):
+            if b.startswith("https://"):
+                bases.append("http://" + b[len("https://") :])
+    return bases
 
 
 def _pushplus_get_json(
@@ -811,14 +853,20 @@ def _pushplus_get_json(
     params: dict | None = None,
     long_poll: bool = False,
 ) -> dict | None:
-    """GET PushPlus OpenAPI，连接失败时重试并尝试 http/https。"""
+    """GET PushPlus OpenAPI；HTTPS 多域名 + 重试，DNS 失败时不无意义地再试 HTTP。"""
+    from urllib.parse import urlparse
+
     params = params or {}
     timeout = _pushplus_http_timeout(long_poll=long_poll)
     retries = max(1, int(os.getenv("TP_PUSHPLUS_HTTP_RETRIES", "3")))
     last_err: Exception | None = None
     bases = _pushplus_api_bases()
+    dns_dead_hosts: set[str] = set()
     for attempt in range(retries):
         for base in bases:
+            host = (urlparse(base).hostname or "").lower()
+            if host and host in dns_dead_hosts:
+                continue
             url = f"{base}{path}"
             try:
                 resp = requests.get(
@@ -834,6 +882,15 @@ def _pushplus_get_json(
                 return data if isinstance(data, dict) else {}
             except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError) as e:
                 last_err = e
+                err_s = str(e)
+                if ":80)" in err_s or "port=80" in err_s:
+                    _log.warning(
+                        "[ClawBot] getMsg 走了 HTTP 80 端口（%s），易 DNS 失败。"
+                        "请关闭 TP_PUSHPLUS_ALLOW_HTTP，并重新打包 TradePilot.exe",
+                        url,
+                    )
+                if host and _is_pushplus_dns_error(e):
+                    dns_dead_hosts.add(host)
             except requests.exceptions.ReadTimeout as e:
                 # 长轮询读超时：服务端挂起后无新消息，属正常情况
                 if long_poll:
@@ -841,6 +898,8 @@ def _pushplus_get_json(
                 last_err = e
             except Exception as e:
                 last_err = e
+                if host and _is_pushplus_dns_error(e):
+                    dns_dead_hosts.add(host)
         if attempt < retries - 1:
             time.sleep(min(2**attempt, 6))
     if last_err is not None:
@@ -859,7 +918,11 @@ def _fetch_clawbot_messages(*, long_poll: bool = False) -> list[dict] | None:
         return []
     ak = _access_key()
     if not ak:
-        return []
+        _log.warning(
+            "[ClawBot] 无 accessKey，无法拉取消息。"
+            "请在 dist/logs/secrets.env 配置 PUSHPLUS_TOKEN 与 PUSHPLUS_SECRET_KEY（PushPlus 开发设置）"
+        )
+        return None
     headers = {"access-key": ak, "Content-Type": "application/json"}
     params = {"longPoll": "true"} if long_poll else {}
     try:
@@ -917,8 +980,12 @@ def _fetch_clawbot_messages(*, long_poll: bool = False) -> list[dict] | None:
         print(f"[clawbot] getMsg exception: {type(e).__name__}: {e}", flush=True)
         return None
     except Exception as e:
-        _log.warning("[ClawBot] getMsg 异常: %s: %s", type(e).__name__, e)
-        print(f"[clawbot] getMsg exception: {type(e).__name__}: {e}", flush=True)
+        _log_pushplus_network_error(e)
+        if _is_pushplus_dns_error(e):
+            # DNS 失败时控制台少刷屏；详情见 WARNING（每 5 分钟最多一条）
+            pass
+        else:
+            print(f"[clawbot] getMsg exception: {type(e).__name__}: {e}", flush=True)
         return None
 
 
@@ -1287,6 +1354,14 @@ def start_clawbot_listener(*, broker, notifier: PushPlusNotifier) -> None:
 
     def _listener_loop():
         _log.info("[ClawBot] 长轮询监听线程已启动")
+        probe = _fetch_clawbot_messages(long_poll=False)
+        if probe is None:
+            _log.warning(
+                "[ClawBot] 启动探活失败：本机连不上 PushPlus getMsg。"
+                "ClawBot 发消息将无自动回复，直到网络/DNS 恢复。"
+            )
+        else:
+            _log.info("[ClawBot] 启动探活 OK（getMsg 可访问）")
         consecutive_errors = 0
         while True:
             try:
