@@ -7,7 +7,7 @@
 - 多标的 Alpha 扫描与买卖信号（不自动下单，需 PushPlus 确认）
 - 舆情 RSS 监控推送（英文标题附中文翻译）
 - ClawBot 微信查询持仓/新闻/价格
-- Cursor Agent 桥接（`clawbot_bridge.mjs`）理解自然语言指令
+- Codex 桥接（`clawbot_bridge.mjs`）理解自然语言指令
 
 ## 环境要求
 
@@ -17,7 +17,7 @@
 | 富途 OpenD | 行情 / 持仓 / 下单 | 是 |
 | PushPlus Token | 推送与 ClawBot 收发 | 是 |
 | Node.js | 仅用于 AI 桥接 `clawbot_bridge.mjs` | 可选（见下文） |
-| `CURSOR_API_KEY` | ClawBot 复杂自然语言 → Cursor AI | 可选 |
+| 本地 Codex CLI 或 `OPENAI_API_KEY` | ClawBot 复杂自然语言 → Codex AI | 可选 |
 
 ---
 
@@ -54,7 +54,7 @@ cd TradePilot
 ```powershell
 pip install -r requirements.txt
 pip install pyinstaller   # 仅打包 exe 时需要
-npm install               # ClawBot AI 桥接需要 @cursor/sdk
+npm install               # 当前桥接无额外依赖；保留用于未来扩展
 ```
 
 ### 3. 配置密钥
@@ -76,7 +76,8 @@ notepad logs\secrets.env
 
 ```env
 PUSHPLUS_TOKEN=你的token
-CURSOR_API_KEY=你的key          # 不用 AI 对话可不填
+# OPENAI_API_KEY=你的key        # 本地 Codex CLI 不可用时再填
+# TP_CODEX_MODEL=gpt-5.1-codex  # 可选；不填则本地 Codex CLI 使用默认模型
 TP_PUSHPLUS_CHANNEL=clawbot
 TP_CLAWBOT_REPLY_CHANNEL=clawbot
 ```
@@ -144,7 +145,7 @@ python -c "import sys; sys.argv[0]=r'C:\path\to\TradePilot\dist\TradePilot.exe';
 
 ## Node.js 与 `TP_NODE_PATH` 的作用
 
-**Node 不是用来跑 TradePilot 主程序的**（主程序是 Python / `TradePilot.exe`）。它只用于启动 **AI 桥接子进程** `clawbot_bridge.mjs`。
+**Node 不是用来跑 TradePilot 主程序的**（主程序是 Python / `TradePilot.exe`）。它只用于启动 **Codex AI 桥接子进程** `clawbot_bridge.mjs`。
 
 ```
 ClawBot 用户发消息
@@ -152,7 +153,7 @@ ClawBot 用户发消息
   → 本地能处理的（帮助 / 新闻 / 持仓 / 价格等）→ 直接 PushPlus 回复
   → 其余复杂问题 → 写入 dist/logs/clawbot_ai_queue.json
   → node.exe 运行 clawbot_bridge.mjs
-  → 调用 Cursor Cloud Agent（@cursor/sdk）
+  → 优先调用本地 Codex CLI；不可用时调用 OpenAI Responses API（Codex 模型）
   → AI 回复推回 ClawBot
 ```
 
@@ -165,8 +166,8 @@ node.exe  <项目根>\clawbot_bridge.mjs
 常见情况：
 
 - 双击 `TradePilot.exe` 时，系统 **PATH 里可能没有 `node`**
-- 未装 Node → 日志：`未找到 node，无法启动 Cursor AI 桥接`
-- 有 `CURSOR_API_KEY` 但无 Node → 仅本地指令可用，**无 AI 自然语言回复**
+- 未装 Node → 日志：`未找到 node，无法启动 Codex AI 桥接`
+- 有本地 Codex CLI 或 `OPENAI_API_KEY` 但无 Node → 仅本地指令可用，**无 AI 自然语言回复**
 
 **`TP_NODE_PATH`**：在 `secrets.env` 中指定 `node.exe` 完整路径，不依赖 PATH。例如使用 Cursor 自带 Node：
 
@@ -177,10 +178,10 @@ TP_NODE_PATH=C:\Users\你的用户名\AppData\Local\Programs\cursor\resources\ap
 | 使用场景 | 是否需要 Node |
 |----------|----------------|
 | 仅「新闻 / 持仓 / 帮助」等本地指令 | 否 |
-| ClawBot 自然语言问 AI、复杂分析 | 是，且需 `CURSOR_API_KEY` |
-| 未配置 `CURSOR_API_KEY` | 桥接不启动，Node 也用不上 |
+| ClawBot 自然语言问 AI、复杂分析 | 是，且需本地 Codex CLI 或 `OPENAI_API_KEY` |
+| 本地 Codex CLI 和 `OPENAI_API_KEY` 都不可用 | 桥接会启动但无法完成 AI 回复 |
 
-安装 Node 后还需在项目根执行一次：`npm install`（安装 `@cursor/sdk`）。
+当前桥接无需 `@cursor/sdk`。默认优先调用本机 Codex CLI；如果不可用，再使用 Node 内置 `fetch` 调用 OpenAI Responses API。
 
 ---
 
@@ -229,9 +230,9 @@ TP_CLAWBOT_REPLY_CHANNEL=clawbot,wechat
 
 检查 `TP_PUSHPLUS_CHANNEL` 是否误设为 `wechat`；ClawBot 对话回复应使用 `TP_CLAWBOT_REPLY_CHANNEL=clawbot`。
 
-**AI 报错 `SQLITE_CONSTRAINT`**
+**AI 报错 OpenAI Responses API 401/403**
 
-确保使用最新 `clawbot_bridge.mjs`（每条消息 `Agent.prompt`，非多轮 `resume`），且只有一个桥接进程（见 `clawbot_bridge.lock`）。
+检查 `dist\logs\secrets.env` 里的 `OPENAI_API_KEY` 是否有效，且账号是否有对应 Codex 模型权限；也可用 `TP_CODEX_MODEL` 切换模型。
 
 **多个 `clawbot_bridge` 进程**
 

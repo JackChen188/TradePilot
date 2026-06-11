@@ -1,12 +1,9 @@
 {
   "name": "tradepilot-clawbot-bridge",
   "version": "1.0.0",
-  "description": "ClawBot → Cursor Agent bridge for TradePilot",
+  "description": "ClawBot → Codex bridge for TradePilot",
   "type": "module",
   "scripts": {
     "bridge": "node clawbot_bridge.mjs"
-  },
-  "dependencies": {
-    "@cursor/sdk": "latest"
   }
 }

@@ -384,6 +384,73 @@ def _is_choppy(kdf: pd.DataFrame, *, window_days: int, abs_ret_pct: float) -> bo
     ret = abs((c1 / c0 - 1.0) * 100.0)
     return ret > float(abs_ret_pct)
 
+
+def _pct_above(value: float, base: float | None) -> float | None:
+    try:
+        if base is None or float(base) <= 0:
+            return None
+        return (float(value) / float(base) - 1.0) * 100.0
+    except Exception:
+        return None
+
+
+def _buy_entry_quality_blocks(
+    *,
+    code: str,
+    ind,
+    bucket: str,
+    rank_pct: float,
+    relaxed_entry: bool,
+) -> list[str]:
+    """
+    Final guardrail before a BUY enters the pending-order pool.
+    It keeps the score model from chasing already-stretched moves.
+    """
+    blocks: list[str] = []
+    bucket_u = str(bucket).upper()
+    is_high_vol = bucket_u == "HIGH_VOL"
+
+    max_ret5d = (
+        float(STRATEGY.high_vol_buy_max_ret5d_pct)
+        if is_high_vol
+        else float(STRATEGY.buy_max_ret5d_pct)
+    )
+    if ind.ret5d_pct is not None and float(ind.ret5d_pct) > max_ret5d:
+        blocks.append(f"ret5d too hot {float(ind.ret5d_pct):.2f}%>{max_ret5d:.2f}%")
+
+    min_ret5d = float(STRATEGY.buy_min_ret5d_pct)
+    if ind.ret5d_pct is not None and float(ind.ret5d_pct) < min_ret5d:
+        blocks.append(f"ret5d falling too fast {float(ind.ret5d_pct):.2f}%<{min_ret5d:.2f}%")
+
+    if ind.rsi14 is not None and float(ind.rsi14) > float(STRATEGY.buy_max_rsi):
+        blocks.append(f"RSI overheat {float(ind.rsi14):.1f}>{float(STRATEGY.buy_max_rsi):.1f}")
+
+    ma20_ext = _pct_above(float(ind.close), ind.ma20)
+    ma20_cap = (
+        float(STRATEGY.high_vol_buy_max_ma20_extension_pct)
+        if is_high_vol
+        else float(STRATEGY.buy_max_ma20_extension_pct)
+    )
+    if ma20_ext is not None and ma20_ext > ma20_cap:
+        blocks.append(f"price extended vs MA20 {ma20_ext:.1f}%>{ma20_cap:.1f}%")
+
+    ma60_ext = _pct_above(float(ind.close), ind.ma60)
+    ma60_cap = (
+        float(STRATEGY.high_vol_buy_max_ma60_extension_pct)
+        if is_high_vol
+        else float(STRATEGY.buy_max_ma60_extension_pct)
+    )
+    if ma60_ext is not None and ma60_ext > ma60_cap:
+        blocks.append(f"price extended vs MA60 {ma60_ext:.1f}%>{ma60_cap:.1f}%")
+
+    if relaxed_entry and float(rank_pct) < float(STRATEGY.buy_relaxed_min_rank_pct):
+        blocks.append(
+            f"relaxed entry rank too low {float(rank_pct) * 100.0:.1f}%"
+            f"<{float(STRATEGY.buy_relaxed_min_rank_pct) * 100.0:.1f}%"
+        )
+
+    return blocks
+
 def _reason_to_plain_text(reason: str) -> str:
     """
     Make strategy reasons more human-readable in notifications.
@@ -1516,6 +1583,10 @@ def _run_once(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
             and ind.ma60 is not None
             and float(current) > float(ind.ma100)
             and float(ind.ma20) > float(ind.ma60)
+            and rank_pct >= float(STRATEGY.buy_relaxed_min_rank_pct)
+            and int(ar.score) >= int(STRATEGY.buy_relaxed_min_base_score)
+            and (ind.ret5d_pct is None or float(ind.ret5d_pct) <= float(STRATEGY.buy_max_ret5d_pct))
+            and (ind.rsi14 is None or float(ind.rsi14) <= float(STRATEGY.buy_max_rsi))
         )
         if market_allows_buy and ar.signal != "BUY" and relaxed_entry:
             ar = analyze(
@@ -1534,10 +1605,23 @@ def _run_once(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
                 score=max(int(ar.score), int(STRATEGY.buy_score_threshold)),
                 signal="BUY",
                 indicators=ar.indicators,
-                reason=f"RELAXED_ENTRY: price>MA100 & MA20>MA60; {ar.reason}",
+                reason=(
+                    f"RELAXED_ENTRY: price>MA100 & MA20>MA60 "
+                    f"& rank>={float(STRATEGY.buy_relaxed_min_rank_pct) * 100.0:.0f}% "
+                    f"& base_score>={int(STRATEGY.buy_relaxed_min_base_score)}; {ar.reason}"
+                ),
                 market_mode=ar.market_mode,
             )
-        scored.append({"code": code_u, "ar": ar, "current": current, "rank_pct": rank_pct, "kdf": kdf})
+        scored.append(
+            {
+                "code": code_u,
+                "ar": ar,
+                "current": current,
+                "rank_pct": rank_pct,
+                "kdf": kdf,
+                "relaxed_entry": relaxed_entry and ar.signal == "BUY",
+            }
+        )
         append_trade_log(
             {
                 "code": code_u,
@@ -1627,6 +1711,24 @@ def _run_once(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
         if str(code_u).upper() == core_symbol:
             continue
         kdf = x["kdf"]
+        bucket = _alpha_bucket(code_u)
+        quality_blocks = _buy_entry_quality_blocks(
+            code=code_u,
+            ind=x["ar"].indicators,
+            bucket=bucket,
+            rank_pct=float(x["rank_pct"]),
+            relaxed_entry=bool(x.get("relaxed_entry", False)),
+        )
+        if quality_blocks:
+            append_trade_log(
+                {
+                    "code": code_u,
+                    "action": "BUY_BLOCKED",
+                    "market_mode": market_mode,
+                    "message": "entry quality guard: " + "; ".join(quality_blocks),
+                }
+            )
+            continue
         holding_any = get_holding_any(holdings, code_u)
         if holding_any is not None and int(getattr(holding_any, "qty", 0)) > 0:
             if not _alpha_allow_add(code_u):
@@ -1650,7 +1752,6 @@ def _run_once(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
             continue
 
         # Entry hardening for HIGH_VOL: higher threshold + breakout required + longer post-sell cooldown.
-        bucket = _alpha_bucket(code_u)
         if bucket == "HIGH_VOL":
             if int(x["ar"].score) < int(STRATEGY.alpha_high_vol_buy_score_threshold):
                 append_trade_log(

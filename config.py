@@ -284,6 +284,18 @@ class StrategyConfig:
     # Realized vol annualized cap for enhancement names (log-only / refresh filter); live uses existing score gates.
     enhancement_vol_cap_ann_pct: float = float(os.getenv("TP_ENHANCEMENT_VOL_CAP_ANN_PCT", "120.0"))
 
+    # Buy-entry quality guardrails. These filters run after the score model and before a pending order is created.
+    buy_max_ret5d_pct: float = float(os.getenv("TP_BUY_MAX_RET5D_PCT", "8.0"))
+    buy_min_ret5d_pct: float = float(os.getenv("TP_BUY_MIN_RET5D_PCT", "-18.0"))
+    buy_max_rsi: float = float(os.getenv("TP_BUY_MAX_RSI", "76.0"))
+    buy_max_ma20_extension_pct: float = float(os.getenv("TP_BUY_MAX_MA20_EXTENSION_PCT", "12.0"))
+    buy_max_ma60_extension_pct: float = float(os.getenv("TP_BUY_MAX_MA60_EXTENSION_PCT", "28.0"))
+    buy_relaxed_min_rank_pct: float = float(os.getenv("TP_BUY_RELAXED_MIN_RANK_PCT", "0.70"))
+    buy_relaxed_min_base_score: int = int(os.getenv("TP_BUY_RELAXED_MIN_BASE_SCORE", "70"))
+    high_vol_buy_max_ret5d_pct: float = float(os.getenv("TP_HIGH_VOL_BUY_MAX_RET5D_PCT", "12.0"))
+    high_vol_buy_max_ma20_extension_pct: float = float(os.getenv("TP_HIGH_VOL_BUY_MAX_MA20_EXTENSION_PCT", "18.0"))
+    high_vol_buy_max_ma60_extension_pct: float = float(os.getenv("TP_HIGH_VOL_BUY_MAX_MA60_EXTENSION_PCT", "45.0"))
+
 
 FUTU = FutuConfig()
 STRATEGY = StrategyConfig()

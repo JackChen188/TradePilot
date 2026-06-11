@@ -88,3 +88,8 @@ def load_secrets_env() -> None:
 def get_cursor_api_key() -> str:
     load_secrets_env()
     return (os.getenv("CURSOR_API_KEY") or "").strip()
+
+
+def get_codex_api_key() -> str:
+    load_secrets_env()
+    return (os.getenv("OPENAI_API_KEY") or "").strip()

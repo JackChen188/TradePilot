@@ -26,13 +26,13 @@ from notifier import PushPlusNotifier
 from pending_orders import PendingOrder, expire_pending_orders, find_pending_match, load_pending_orders, save_pending_orders
 from report import append_trade_record
 from risk_manager import append_trade_log
-from secrets_loader import get_cursor_api_key, load_secrets_env, resolve_project_root, resolve_runtime_dir
+from secrets_loader import load_secrets_env, resolve_project_root, resolve_runtime_dir
 
 # 支持查询的股票代码正则（US.CRWV 或 CRWV 形式）
 _TICKER_RE = re.compile(r"\b(?:US\.)?([A-Z]{1,6})\b")
 _STRATEGY_SIGNAL_RE = re.compile(r"signal\s*=\s*(BUY|SELL|HOLD)", re.I)
 
-# ClawBot → Cursor Agent 消息队列（与 exe 工作目录 logs/ 对齐）
+# ClawBot → Codex 消息队列（与 exe 工作目录 logs/ 对齐）
 def _ai_queue_path() -> str:
     return os.path.join(resolve_runtime_dir(), "logs", "clawbot_ai_queue.json")
 
@@ -88,18 +88,6 @@ def _find_node_executable() -> str | None:
             return os.path.abspath(override)
         _log.warning("[ClawBot] TP_NODE_PATH 不存在: %s", override)
 
-    found = shutil.which("node")
-    if found and os.path.isfile(found):
-        return os.path.abspath(found)
-
-    for part in (os.environ.get("PATH") or "").split(os.pathsep):
-        part = part.strip()
-        if not part:
-            continue
-        p = os.path.join(part, "node.exe")
-        if os.path.isfile(p):
-            return os.path.abspath(p)
-
     localappdata = os.environ.get("LOCALAPPDATA", "")
     appdata = os.environ.get("APPDATA", "")
     program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
@@ -112,6 +100,7 @@ def _find_node_executable() -> str | None:
 
     static_candidates.extend(
         [
+            os.path.join(localappdata, "OpenAI", "Codex", "bin", "node.exe"),
             os.path.join(program_files, "nodejs", "node.exe"),
             os.path.join(program_files_x86, "nodejs", "node.exe"),
             os.path.join(
@@ -145,6 +134,18 @@ def _find_node_executable() -> str | None:
 
     for p in static_candidates:
         if p and os.path.isfile(p):
+            return os.path.abspath(p)
+
+    found = shutil.which("node")
+    if found and os.path.isfile(found):
+        return os.path.abspath(found)
+
+    for part in (os.environ.get("PATH") or "").split(os.pathsep):
+        part = part.strip()
+        if not part:
+            continue
+        p = os.path.join(part, "node.exe")
+        if os.path.isfile(p):
             return os.path.abspath(p)
 
     return None
@@ -225,7 +226,7 @@ def _enqueue_ai_message(
     broker=None,
 ) -> None:
     """
-    将 ClawBot 用户原话写入队列，由 clawbot_bridge.mjs 转发给 Cursor Agent 理解并回复。
+    将 ClawBot 用户原话写入队列，由 clawbot_bridge.mjs 转发给 Codex 理解并回复。
     不再依赖关键词硬匹配。
     """
     queue_path = _ai_queue_path()
@@ -249,7 +250,7 @@ def _enqueue_ai_message(
         )
         with open(queue_path, "w", encoding="utf-8") as f:
             json.dump(queue[-500:], f, ensure_ascii=False, indent=2)
-        _log.info("[ClawBot] 已入队 Cursor AI: %s (id=%s)", text[:80], entry_id)
+        _log.info("[ClawBot] 已入队 Codex AI: %s (id=%s)", text[:80], entry_id)
     except Exception as e:
         _log.error("[ClawBot] enqueue_ai_message error: %s", e)
 
@@ -382,7 +383,7 @@ def _explain_tradepilot_signal_line(text: str) -> str:
     lines.extend(
         [
             "",
-            "其他自然语言问题（非粘贴 signal= 日志）会交给 Cursor AI 回答。",
+            "其他自然语言问题（非粘贴 signal= 日志）会交给 Codex AI 回答。",
         ]
     )
     return "\n".join(lines)
@@ -418,7 +419,7 @@ def _handle_clawbot_query(text: str, *, notifier: PushPlusNotifier, broker=None)
         )
         return True
 
-    # 连通性自检（秒回，不依赖 Cursor AI）
+    # 连通性自检（秒回，不依赖 Codex AI）
     if t in ("测试", "ping", "PING", "连通", "连通测试"):
         _clawbot_send(
             notifier,
@@ -445,7 +446,7 @@ def _handle_clawbot_query(text: str, *, notifier: PushPlusNotifier, broker=None)
                 "【策略信号解读】\n"
                 "  粘贴控制台一行：US.ZS signal=BUY score=70 ...\n\n"
                 "【AI 对话】\n"
-                "  其他自然语言（非上述格式）会交给 Cursor AI\n\n"
+                "  其他自然语言（非上述格式）会交给 Codex AI\n\n"
                 "【价格查询】\n"
                 "  CRWV现在多少\n"
                 "  TQQQ价格\n\n"
@@ -1251,22 +1252,10 @@ def _process_one_clawbot_msg(text: str, mid: str, *, broker, notifier: PushPlusN
     cmd_line = _extract_confirm_cmd_line(text)
 
     if not cmd_line:
-        # 先走本地规则（新闻/持仓/帮助等），秒回 ClawBot；其余再交给 Cursor AI
+        # 先走本地规则（新闻/持仓/帮助等），秒回 ClawBot；其余再交给 Codex AI
         if _handle_clawbot_query(text, notifier=notifier, broker=broker):
             return
-        api_key = get_cursor_api_key()
-        if api_key:
-            _enqueue_ai_message(text, mid, broker=broker)
-        else:
-            _clawbot_send(
-                notifier,
-                title="⚠️ Cursor AI 未启用",
-                    content=(
-                        "请设置环境变量 CURSOR_API_KEY 后重启 TradePilot，\n"
-                        "即可用自然语言远程对话（无需记指令关键词）。\n\n"
-                        "获取地址：https://cursor.com/dashboard/cloud-agents"
-                    ),
-            )
+        _enqueue_ai_message(text, mid, broker=broker)
         return
 
     # 下单确认
@@ -1415,7 +1404,7 @@ def start_clawbot_listener(*, broker, notifier: PushPlusNotifier) -> None:
     t.start()
 
 
-# ── Cursor AI 桥接进程（Node + @cursor/sdk）──────────────────────────────────
+# ── Codex AI 桥接进程（Node + OpenAI Responses API）──────────────────────────
 
 _bridge_proc: subprocess.Popen | None = None
 _bridge_lock = threading.Lock()
@@ -1423,14 +1412,10 @@ _bridge_lock = threading.Lock()
 
 def start_clawbot_bridge_process() -> None:
     """
-    启动 clawbot_bridge.mjs：从队列读取用户原话 → Cursor Agent → 微信回复。
-    需要 CURSOR_API_KEY 和 node 可用。
+    启动 clawbot_bridge.mjs：从队列读取用户原话 → Codex → 微信回复。
+    优先使用本地 Codex CLI；若不可用，可用 OPENAI_API_KEY 走 Responses API。
     """
     global _bridge_proc
-    api_key = get_cursor_api_key()
-    if not api_key:
-        _log.warning("[ClawBot] 未设置 CURSOR_API_KEY，跳过 Cursor AI 桥接")
-        return
 
     project_root = resolve_project_root()
     bridge_script = os.path.join(project_root, "clawbot_bridge.mjs")
@@ -1441,7 +1426,7 @@ def start_clawbot_bridge_process() -> None:
     node = _find_node_executable()
     if not node:
         _log.warning(
-            "[ClawBot] 未找到 node，无法启动 Cursor AI 桥接。"
+            "[ClawBot] 未找到 node，无法启动 Codex AI 桥接。"
             "请安装 Node.js 或设置环境变量 TP_NODE_PATH=node.exe完整路径"
         )
         return
@@ -1466,7 +1451,7 @@ def start_clawbot_bridge_process() -> None:
 
         env = os.environ.copy()
         load_secrets_env()
-        env.update({k: v for k, v in os.environ.items() if k.startswith(("CURSOR_", "PUSHPLUS_", "TP_"))})
+        env.update({k: v for k, v in os.environ.items() if k.startswith(("OPENAI_", "PUSHPLUS_", "TP_"))})
         if not env.get("TP_CLAWBOT_REPLY_CHANNEL"):
             env["TP_CLAWBOT_REPLY_CHANNEL"] = "clawbot"
         env["TP_AI_QUEUE_PATH"] = _ai_queue_path()
@@ -1484,11 +1469,11 @@ def start_clawbot_bridge_process() -> None:
         try:
             _bridge_proc = subprocess.Popen([node, bridge_script], **kwargs)
             _log.info(
-                "[ClawBot] Cursor AI 桥接已启动 pid=%s node=%s queue=%s",
+                "[ClawBot] Codex AI 桥接已启动 pid=%s node=%s queue=%s",
                 _bridge_proc.pid,
                 node,
                 env["TP_AI_QUEUE_PATH"],
             )
         except Exception as e:
-            _log.error("[ClawBot] 启动 Cursor AI 桥接失败: %s", e)
+            _log.error("[ClawBot] 启动 Codex AI 桥接失败: %s", e)
 
