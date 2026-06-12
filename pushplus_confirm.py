@@ -915,7 +915,7 @@ def _fetch_clawbot_messages(*, long_poll: bool = False) -> list[dict] | None:
     返回 [{"text", "msg_id", "create_time"}, ...]；网络/API 失败返回 None（与「无新消息」区分）。
     仅返回 type=1（文字）消息。
     """
-    if os.getenv("TP_CLAWBOT_ENABLED", "1").strip() in ("0", "false", "False", "no"):
+    if os.getenv("TP_CLAWBOT_ENABLED", "0").strip().lower() in ("0", "false", "no"):
         return []
     ak = _access_key()
     if not ak:
@@ -1103,6 +1103,9 @@ def process_pushplus_confirmations(*, broker, notifier: PushPlusNotifier) -> Non
     - Send a PushPlus message to yourself with title starting with 'TP_CONFIRM'
     - Content must be: YES BUY symbol qty confirm_code  (or SELL)
     """
+    if os.getenv("TP_PUSHPLUS_CONFIRM_ENABLED", "0").strip().lower() not in ("1", "true", "yes"):
+        return
+
     ak = _access_key()
     if not ak:
         return

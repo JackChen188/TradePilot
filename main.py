@@ -1076,6 +1076,7 @@ def _run_once(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
         available_cash = 0.0
         total_assets = 0.0
 
+    position_snapshot_ok = False
     try:
         pos_df = broker.get_positions()
         pos_map = {}
@@ -1088,9 +1089,60 @@ def _run_once(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
                     pos_map[code] = 0
         else:
             pos_map = {}
+        position_snapshot_ok = True
     except Exception as e:
         pos_map = {}
         append_trade_log({"action": "ERROR", "error": f"position_snapshot_failed: {e}"})
+
+    if position_snapshot_ok:
+        holdings_changed = False
+        now_utc = _now_iso()
+        for h in holdings:
+            code = str(h.symbol).strip().upper()
+            broker_qty = int(pos_map.get(code, 0))
+            if int(h.qty) > 0 and broker_qty <= 0:
+                append_trade_log(
+                    {
+                        "code": code,
+                        "action": "LOCAL_HOLDING_SYNC",
+                        "qty": int(h.qty),
+                        "message": "broker position is zero; local holding reset to zero",
+                    }
+                )
+                h.qty = 0
+                h.updated_at = now_utc
+                h.highest_price_since_entry = 0.0
+                h.trailing_armed = False
+                h.trailing_active = False
+                h.partial_take_profit_done = False
+                h.initial_qty = 0
+                h.add_position_count = 0
+                h.last_peak_update_utc = now_utc
+                h.last_sell_time = now_utc
+                holdings_changed = True
+        if holdings_changed:
+            save_holdings(holdings)
+
+        pending_changed = False
+        for po in pending_orders:
+            if po.status != "PENDING" or str(po.side).upper() != "SELL":
+                continue
+            broker_qty = int(pos_map.get(str(po.symbol).strip().upper(), 0))
+            if broker_qty < int(po.qty):
+                po.status = "CANCELLED"
+                po.updated_at = now_utc
+                po.message = f"Cancelled by broker position sync: held={broker_qty} need={int(po.qty)}"
+                pending_changed = True
+                append_trade_log(
+                    {
+                        "code": po.symbol,
+                        "action": "PENDING_SELL_CANCELLED",
+                        "qty": int(po.qty),
+                        "message": po.message,
+                    }
+                )
+        if pending_changed:
+            save_pending_orders(pending_orders)
 
     core_symbol = str(TRADE.core_symbol).upper()
     core_qty = int(pos_map.get(core_symbol, 0))
@@ -1894,7 +1946,9 @@ def _maybe_send_daily_report_task(broker: FutuLiveBroker, notifier: PushPlusNoti
             return
         summary = build_daily_summary(broker=broker)
         write_daily_report_csv(summary)
-        ok, msg = notifier.send(title="TradePilot 每日交易日志", content=format_daily_push_content(summary))
+        title = "TradePilot 每日交易日志"
+        content = format_daily_push_content(summary)
+        ok, msg = notifier.send(title=title, content=content)
         if ok:
             mark_daily_push_sent()
             append_trade_log({"action": "DAILY_REPORT_PUSH", "message": f"time={target} ok={ok} resp={msg}"})
@@ -1962,7 +2016,7 @@ def main() -> None:
         )
     )
     notifier = PushPlusNotifier(token_env="PUSHPLUS_TOKEN")
-    print(f"PushPlus enabled={notifier.enabled()} (env=PUSHPLUS_TOKEN)")
+    print(f"Notifier enabled={notifier.enabled()} backend={os.getenv('TP_NOTIFICATION_BACKEND', 'auto')}")
     print(f"Polling interval: {STRATEGY.poll_interval_seconds} seconds")
     try:
         import data_provider as _dp
@@ -2065,15 +2119,16 @@ def main() -> None:
             _start_news_monitor_thread(notifier, _news_symbols)
         except Exception as _exc:
             print(f"[NEWS] 启动监控线程失败: {_exc}", flush=True)
-        # Start ClawBot long-poll listener thread (real-time WeChat message handling).
-        try:
-            start_clawbot_listener(broker=broker, notifier=notifier)
-        except Exception as _exc:
-            print(f"[ClawBot] 启动监听线程失败: {_exc}", flush=True)
-        try:
-            start_clawbot_bridge_process()
-        except Exception as _exc:
-            print(f"[ClawBot] 启动 Cursor AI 桥接失败: {_exc}", flush=True)
+        if os.getenv("TP_CLAWBOT_ENABLED", "0").strip().lower() in ("1", "true", "yes"):
+            # Start ClawBot long-poll listener thread (real-time WeChat message handling).
+            try:
+                start_clawbot_listener(broker=broker, notifier=notifier)
+            except Exception as _exc:
+                print(f"[ClawBot] 启动监听线程失败: {_exc}", flush=True)
+            try:
+                start_clawbot_bridge_process()
+            except Exception as _exc:
+                print(f"[ClawBot] 启动 Cursor AI 桥接失败: {_exc}", flush=True)
         # Startup push
         try:
             now_iso = _now_iso()

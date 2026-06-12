@@ -48,7 +48,14 @@ def _project_root() -> str:
     return resolve_project_root()
 
 
-_CONFIG_OVERRIDE_KEYS = frozenset({"TP_PUSHPLUS_CHANNEL", "TP_CLAWBOT_REPLY_CHANNEL"})
+_CONFIG_OVERRIDE_KEYS = frozenset(
+    {
+        "TP_PUSHPLUS_CHANNEL",
+        "TP_CLAWBOT_REPLY_CHANNEL",
+        "TP_NOTIFICATION_BACKEND",
+        "TP_WECOM_WEBHOOK_URL",
+    }
+)
 
 
 def _parse_dotenv(path: str) -> None:

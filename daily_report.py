@@ -268,25 +268,42 @@ def write_daily_report_csv(summary: DailySummary, path: str = DAILY_REPORT_PATH)
         )
 
 
+def _clean_daily_text(value: object) -> str:
+    text = str(value or "").strip()
+    return {
+        "鏃犳寔浠?": "\u65e0\u6301\u4ed3",
+        "鏃犲紓甯?": "\u65e0\u5f02\u5e38",
+        "鏃?": "\u65e0",
+    }.get(text, text)
+
+
+def _clean_holding_text(value: object) -> str:
+    text = _clean_daily_text(value)
+    return "\u65e0\u6301\u4ed3" if "?" in text else text
+
+
+def _clean_error_text(value: object) -> str:
+    text = _clean_daily_text(value)
+    return "\u65e0\u5f02\u5e38" if "?" in text else text
+
+
 def format_daily_push_content(summary: DailySummary) -> str:
     return (
-        f"今日日期(本地): {summary.date_local}\n"
-        f"今日信号数量: {summary.signal_count}\n"
-        f"今日下单次数: {summary.order_count}\n"
-        f"今日成交次数: {summary.filled_count}\n"
-        f"当前持仓: {summary.holding_text}\n"
-        f"今日已实现盈亏: {summary.realized_pnl:.2f}\n"
-        f"币种: USD\n"
-        f"当前账户现金(USD): {summary.available_cash:.2f}\n"
-        f"当前账户总资产(USD): {summary.total_assets:.2f}\n"
-        f"当前市场模式: {summary.market_mode}\n"
-        f"账户回撤: {summary.account_drawdown_pct:.2f}%\n"
-        f"今日候选排名: {summary.candidate_ranking}\n"
-        f"当前组合收益: {summary.portfolio_return_pct:.2f}%\n"
-        f"CORE收益: {summary.core_return_pct:.2f}%\n"
-        f"ALPHA收益: {summary.alpha_return_pct:.2f}%\n"
-        f"是否跑赢VOO: {'YES' if summary.outperform_voo else 'NO'}\n"
-        f"当前仓位分布: {summary.allocation_text}\n"
-        f"今日异常摘要: {summary.error_summary}"
+        f"\u62a5\u544a\u65e5\u671f(\u672c\u5730): {summary.date_local}\n"
+        f"\u4eca\u65e5\u4fe1\u53f7\u6570\u91cf: {summary.signal_count}\n"
+        f"\u4eca\u65e5\u4e0b\u5355\u6b21\u6570: {summary.order_count}\n"
+        f"\u4eca\u65e5\u6210\u4ea4\u6b21\u6570: {summary.filled_count}\n"
+        f"\u5f53\u524d\u6301\u4ed3: {_clean_holding_text(summary.holding_text)}\n"
+        f"\u4eca\u65e5\u5df2\u5b9e\u73b0\u76c8\u4e8f: {summary.realized_pnl:.2f} USD\n"
+        f"\u5f53\u524d\u8d26\u6237\u73b0\u91d1: {summary.available_cash:.2f} USD\n"
+        f"\u5f53\u524d\u8d26\u6237\u603b\u8d44\u4ea7: {summary.total_assets:.2f} USD\n"
+        f"\u5f53\u524d\u5e02\u573a\u6a21\u5f0f: {_clean_daily_text(summary.market_mode)}\n"
+        f"\u8d26\u6237\u56de\u64a4: {summary.account_drawdown_pct:.2f}%\n"
+        f"\u4eca\u65e5\u5019\u9009\u6392\u540d: {_clean_daily_text(summary.candidate_ranking)}\n"
+        f"\u5f53\u524d\u7ec4\u5408\u6536\u76ca: {summary.portfolio_return_pct:.2f}%\n"
+        f"CORE\u6536\u76ca: {summary.core_return_pct:.2f}%\n"
+        f"ALPHA\u6536\u76ca: {summary.alpha_return_pct:.2f}%\n"
+        f"\u662f\u5426\u8dd1\u8d62VOO: {'YES' if summary.outperform_voo else 'NO'}\n"
+        f"\u5f53\u524d\u4ed3\u4f4d\u5206\u5e03: {_clean_daily_text(summary.allocation_text)}\n"
+        f"\u4eca\u65e5\u5f02\u5e38\u6458\u8981: {_clean_error_text(summary.error_summary)}"
     )
-
