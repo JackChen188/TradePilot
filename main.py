@@ -23,6 +23,7 @@ from broker_futu import FutuLiveBroker, FutuLiveBrokerConfig
 from config import FUTU, STRATEGY, TRADE
 from alpha_multifactor import load_symbol_list_json
 from data_provider import fetch_daily_kline, get_last_price
+from fundamental_factors import build_fundamental_inputs, score_fundamentals
 from market_risk_overlay import RiskOverlayAdjustments, build_overlay
 from gui_confirm import confirm_order_dialog
 from daily_report import (
@@ -186,6 +187,61 @@ def _format_candidate_ranking(candidates: list[dict]) -> str:
     sorted_items = sorted(candidates, key=lambda x: (-int(x.get("score", 0)), str(x.get("code", ""))))
     top = sorted_items[:5]
     return ", ".join([f"{x['code']}:{int(x['score'])}" for x in top])
+
+
+def _apply_fundamental_score(ar, fscore, *, buy_threshold: int, market_allows_buy: bool):
+    if fscore is None:
+        return ar
+    base_score = int(ar.score)
+    final_score = max(0, min(100, base_score + int(fscore.adjustment)))
+    detail = fscore.reason
+
+    if ar.market_mode == "DEFENSE":
+        return type(ar)(
+            code=ar.code,
+            score=final_score,
+            signal=ar.signal,
+            indicators=ar.indicators,
+            reason=f"{ar.reason}; {detail}",
+            market_mode=ar.market_mode,
+        )
+
+    if ar.signal == "SELL":
+        return type(ar)(
+            code=ar.code,
+            score=final_score,
+            signal=ar.signal,
+            indicators=ar.indicators,
+            reason=f"{ar.reason}; {detail}",
+            market_mode=ar.market_mode,
+        )
+
+    if market_allows_buy and final_score >= int(buy_threshold):
+        if ar.signal == "BUY":
+            reason = f"{ar.reason}; {detail}"
+        else:
+            reason = f"BUY signal: technical near threshold plus fundamentals ({base_score}->{final_score}); {detail}; {ar.reason}"
+        return type(ar)(
+            code=ar.code,
+            score=final_score,
+            signal="BUY",
+            indicators=ar.indicators,
+            reason=reason,
+            market_mode=ar.market_mode,
+        )
+
+    if ar.signal == "BUY" and final_score < int(buy_threshold):
+        reason = f"HOLD: fundamentals pulled BUY below threshold ({base_score}->{final_score}); {detail}; {ar.reason}"
+    else:
+        reason = f"{ar.reason}; {detail}"
+    return type(ar)(
+        code=ar.code,
+        score=final_score,
+        signal="HOLD",
+        indicators=ar.indicators,
+        reason=reason,
+        market_mode=ar.market_mode,
+    )
 
 
 def _cash_pct_for_symbol(code: str) -> float:
@@ -1598,6 +1654,21 @@ def _run_once(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
             print(f"[ERROR] {code_u} {err}")
             append_trade_log({"code": code_u, "action": "ERROR", "error": err})
 
+    fundamental_inputs = {}
+    if bool(getattr(STRATEGY, "fundamental_score_enabled", True)) and raw_candidates:
+        try:
+            fundamental_inputs = build_fundamental_inputs(
+                broker.quote_ctx,
+                [str(x["code"]) for x in raw_candidates],
+                kline_by_code={str(x["code"]).upper(): x["kdf"] for x in raw_candidates},
+                pcf_scan_enabled=bool(getattr(STRATEGY, "fundamental_pcf_scan_enabled", True)),
+                pcf_scan_max_pages=int(getattr(STRATEGY, "fundamental_pcf_scan_max_pages", 45)),
+                pcf_scan_page_size=int(getattr(STRATEGY, "fundamental_pcf_scan_page_size", 200)),
+            )
+        except Exception as e:
+            append_trade_log({"action": "ERROR", "error": f"fundamental_inputs_failed: {type(e).__name__}: {e}"})
+            fundamental_inputs = {}
+
     ret_values = sorted([float(x["ind"].ret63_pct) for x in raw_candidates if x["ind"].ret63_pct is not None], reverse=True)
     rank_map: dict[str, float] = {}
     for item in raw_candidates:
@@ -1664,6 +1735,20 @@ def _run_once(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
                 ),
                 market_mode=ar.market_mode,
             )
+        fscore = None
+        if fundamental_inputs:
+            finput = fundamental_inputs.get(code_u)
+            if finput is not None:
+                fscore = score_fundamentals(
+                    finput,
+                    max_adjustment=int(getattr(STRATEGY, "fundamental_score_max_adjustment", 12)),
+                )
+                ar = _apply_fundamental_score(
+                    ar,
+                    fscore,
+                    buy_threshold=int(STRATEGY.buy_score_threshold),
+                    market_allows_buy=market_allows_buy,
+                )
         scored.append(
             {
                 "code": code_u,
@@ -1672,8 +1757,11 @@ def _run_once(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
                 "rank_pct": rank_pct,
                 "kdf": kdf,
                 "relaxed_entry": relaxed_entry and ar.signal == "BUY",
+                "fundamental": fscore,
+                "fundamental_size_multiplier": float(getattr(fscore, "size_multiplier", 1.0) or 1.0),
             }
         )
+        fundamental_message = f"; {fscore.reason}" if fscore is not None else ""
         append_trade_log(
             {
                 "code": code_u,
@@ -1690,7 +1778,7 @@ def _run_once(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
                 "market_mode": market_mode,
                 "account_drawdown_pct": risk_state.drawdown_pct,
                 "candidate_rank": f"{rank_pct * 100.0:.1f}%",
-                "message": f"{ar.reason}; strong_exception={strong_exception}; ignore_rsi={ignore_rsi}",
+                "message": f"{ar.reason}; strong_exception={strong_exception}; ignore_rsi={ignore_rsi}{fundamental_message}",
             }
         )
         print(f"{code_u} signal={ar.signal} score={ar.score} rank={rank_pct * 100.0:.1f}% | {ar.reason}")
@@ -1879,7 +1967,8 @@ def _run_once(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
             is_add = bool(best.get("is_add", False))
             holding_any = best.get("holding_any")
             sleeve_pct = _alpha_buy_cash_pct(code_u)
-            cash_pct = float(STRATEGY.alpha_ratio) * float(sleeve_pct)
+            fundamental_size = float(best.get("fundamental_size_multiplier", 1.0) or 1.0)
+            cash_pct = float(STRATEGY.alpha_ratio) * float(sleeve_pct) * float(fundamental_size)
             custom_constraints = PositionConstraints(
                 max_trade_cash_pct=cash_pct,
                 max_symbol_asset_pct=constraints.max_symbol_asset_pct,
@@ -1919,6 +2008,7 @@ def _run_once(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
                     score=ar.score,
                     reason=(
                         f"{ar.reason}; rank={best['rank_pct']*100.0:.1f}%; cash_pct={cash_pct:.2f}; "
+                        f"fundamental_size={fundamental_size:.2f}; "
                         f"{'ADD_POSITION' if is_add else 'INITIAL_ENTRY'}"
                     ),
                     holding_count=active_holdings_count,

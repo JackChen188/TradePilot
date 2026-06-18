@@ -296,6 +296,27 @@ class StrategyConfig:
     high_vol_buy_max_ma20_extension_pct: float = float(os.getenv("TP_HIGH_VOL_BUY_MAX_MA20_EXTENSION_PCT", "18.0"))
     high_vol_buy_max_ma60_extension_pct: float = float(os.getenv("TP_HIGH_VOL_BUY_MAX_MA60_EXTENSION_PCT", "45.0"))
 
+    # Fundamental overlay for Alpha selection.
+    # Listing age controls how much PE/cash-flow evidence is trusted:
+    # young growth stocks get weak PE penalties; mature loss makers get stronger penalties.
+    fundamental_score_enabled: bool = os.getenv("TP_FUNDAMENTAL_SCORE_ENABLED", "1").strip() not in (
+        "0",
+        "false",
+        "False",
+        "no",
+        "NO",
+    )
+    fundamental_score_max_adjustment: int = int(os.getenv("TP_FUNDAMENTAL_SCORE_MAX_ADJUSTMENT", "12"))
+    fundamental_pcf_scan_enabled: bool = os.getenv("TP_FUNDAMENTAL_PCF_SCAN_ENABLED", "1").strip() not in (
+        "0",
+        "false",
+        "False",
+        "no",
+        "NO",
+    )
+    fundamental_pcf_scan_max_pages: int = int(os.getenv("TP_FUNDAMENTAL_PCF_SCAN_MAX_PAGES", "45"))
+    fundamental_pcf_scan_page_size: int = int(os.getenv("TP_FUNDAMENTAL_PCF_SCAN_PAGE_SIZE", "200"))
+
 
 FUTU = FutuConfig()
 STRATEGY = StrategyConfig()
