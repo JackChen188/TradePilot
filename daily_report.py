@@ -5,6 +5,7 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 from config import STRATEGY
@@ -151,6 +152,76 @@ def _load_runtime_snapshot(path: str = RUNTIME_SNAPSHOT_PATH) -> dict:
         return {}
 
 
+def _format_local_holdings() -> str:
+    holdings = [h for h in load_holdings() if int(h.qty) > 0]
+    if not holdings:
+        return "\u65e0\u6301\u4ed3"
+    return ", ".join([f"{h.symbol}:{h.qty}@{h.buy_price:.2f}" for h in holdings])
+
+
+def _row_first(row, names: tuple[str, ...], default=0):
+    for name in names:
+        value = row.get(name, None)
+        if value is not None and str(value).strip() != "":
+            return value
+    return default
+
+
+def _format_broker_holdings(broker) -> Optional[str]:
+    if broker is None:
+        return None
+    try:
+        df = broker.get_positions()
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return "\u65e0\u6301\u4ed3"
+
+    lines: list[str] = []
+    for _, row in df.iterrows():
+        try:
+            qty = int(float(_row_first(row, ("qty", "position_qty", "holding_qty", "can_sell_qty"), 0) or 0))
+        except Exception:
+            qty = 0
+        if qty <= 0:
+            continue
+
+        symbol = str(_row_first(row, ("code", "stock_code", "security_code", "symbol"), "") or "").strip().upper()
+        if not symbol:
+            continue
+        try:
+            cost = float(_row_first(row, ("cost_price", "pl_cost_price", "average_cost", "avg_cost"), 0) or 0)
+        except Exception:
+            cost = 0.0
+        try:
+            market_val = float(_row_first(row, ("market_val", "market_value", "position_market_value"), 0) or 0)
+        except Exception:
+            market_val = 0.0
+
+        if market_val > 0:
+            lines.append(f"{symbol}:{qty}@{cost:.2f} value={market_val:.2f}")
+        else:
+            lines.append(f"{symbol}:{qty}@{cost:.2f}")
+
+    return ", ".join(lines) if lines else "\u65e0\u6301\u4ed3"
+
+
+def _looks_like_no_holdings(text: str) -> bool:
+    return _clean_holding_text(text) == "\u65e0\u6301\u4ed3"
+
+
+def _has_non_cash_assets(*, cash: float, assets: float) -> bool:
+    if assets <= 0:
+        return False
+    non_cash = float(assets) - max(float(cash), 0.0)
+    return non_cash > max(1.0, float(assets) * 0.01)
+
+
+def _format_unknown_broker_holdings(*, cash: float, assets: float) -> str:
+    non_cash = max(0.0, float(assets) - max(float(cash), 0.0))
+    return f"\u6301\u4ed3\u6570\u636e\u672a\u8fd4\u56de\uff08\u975e\u73b0\u91d1\u8d44\u4ea7\u7ea6 {non_cash:.2f} USD\uff09"
+
+
 def build_daily_summary(*, broker, trade_log_path: str = TRADE_LOG_PATH) -> DailySummary:
     rows = _load_today_rows(trade_log_path)
     signal_count = sum(1 for r in rows if str(r.get("action", "")).upper() in ("BUY", "SELL") and _to_int(r.get("selected", 0)) == 0)
@@ -174,11 +245,6 @@ def build_daily_summary(*, broker, trade_log_path: str = TRADE_LOG_PATH) -> Dail
                 errs.append(f"{a}: {msg}")
     err_summary = " | ".join(errs[:5]) if errs else "无异常"
 
-    holdings = [h for h in load_holdings() if int(h.qty) > 0]
-    holding_text = "无持仓"
-    if holdings:
-        holding_text = ", ".join([f"{h.symbol}:{h.qty}@{h.buy_price:.2f}" for h in holdings])
-
     realized = _calc_realized_pnl_from_rows(rows)
     try:
         cash = float(broker.get_available_cash())
@@ -188,6 +254,13 @@ def build_daily_summary(*, broker, trade_log_path: str = TRADE_LOG_PATH) -> Dail
         assets = float(broker.get_total_assets())
     except Exception:
         assets = 0.0
+
+    holding_text = _format_broker_holdings(broker)
+    if holding_text is None:
+        holding_text = _format_local_holdings()
+    if _looks_like_no_holdings(holding_text) and _has_non_cash_assets(cash=cash, assets=assets):
+        holding_text = _format_unknown_broker_holdings(cash=cash, assets=assets)
+
     snapshot = _load_runtime_snapshot()
     market_mode = str(snapshot.get("market_mode", "未知"))
     drawdown_pct = _to_float(snapshot.get("account_drawdown_pct", 0.0))
