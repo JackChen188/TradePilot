@@ -77,9 +77,23 @@ from news_verdict_tracker import (
     build_weekly_verdict_push,
     evaluate_pending_outcomes,
 )
+from recommendation_review import (
+    build_recommendation_review_text,
+    evaluate_recommendation_outcomes,
+    log_daily_recommendations,
+    mark_recommendations_evaluated_today,
+    should_evaluate_recommendations_today,
+)
+from weekly_backtest_runner import (
+    format_weekly_backtest_summary,
+    mark_weekly_backtest_run,
+    run_weekly_backtest_3y,
+    should_run_weekly_backtest_now,
+)
 
 WATCHLIST_PATH = os.path.join("config", "watchlist.json")
 ALPHA_FACTOR_UNIVERSE_PATH = os.path.join("config", "alpha_factor_universe.json")
+RECOMMENDED_WATCHLIST_PATH = os.path.join("config", "recommended_watchlist.json")
 RUNTIME_SNAPSHOT_PATH = os.path.join("logs", "runtime_snapshot.json")
 CORE_STATE_PATH = os.path.join("logs", "core_state.json")
 PORTFOLIO_STATE_PATH = os.path.join("logs", "portfolio_state.json")
@@ -120,10 +134,11 @@ def _alpha_cycle_symbols() -> list[str]:
     """
     wl = [str(s).strip().upper() for s in _load_watchlist_symbols() if str(s).strip()]
     factor_syms = load_symbol_list_json(ALPHA_FACTOR_UNIVERSE_PATH)
+    recommended_syms = load_symbol_list_json(RECOMMENDED_WATCHLIST_PATH)
     allowed = TRADE.alpha_tradable_codes
     core_sym = str(TRADE.core_symbol).strip().upper()
     merged: set[str] = set()
-    for s in wl + factor_syms + list(TRADE.alpha_extended_symbols):
+    for s in wl + factor_syms + recommended_syms + list(TRADE.alpha_extended_symbols):
         u = str(s).strip().upper()
         if u and u in allowed and u != core_sym:
             merged.add(u)
@@ -1786,6 +1801,17 @@ def _run_once(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
     ranking_text = _format_candidate_ranking([{"code": x["code"], "score": x["ar"].score} for x in scored])
     price_map = {str(x["code"]).upper(): float(x["current"]) for x in scored}
     core_price = float(price_map.get(core_symbol, get_last_price(broker.quote_ctx, core_symbol)))
+    try:
+        logged_n = log_daily_recommendations(
+            [{**x, "score": int(x["ar"].score)} for x in scored],
+            benchmark_code=core_symbol,
+            benchmark_price=core_price,
+            top_n=5,
+        )
+        if logged_n > 0:
+            append_trade_log({"action": "RECOMMENDATION_LOG", "message": f"logged={logged_n} top recommendations"})
+    except Exception as e:
+        append_trade_log({"action": "ERROR", "error": f"recommendation_log_failed: {type(e).__name__}: {e}"})
     core_value = float(core_qty) * float(core_price)
     alpha_value = max(0.0, float(total_assets) - float(core_value))
     alloc_text = f"CORE={core_value:.2f}({(core_value/total_assets*100.0) if total_assets>0 else 0.0:.1f}%), ALPHA={alpha_value:.2f}"
@@ -2086,6 +2112,34 @@ def _maybe_send_weekly_verdict_review(notifier: PushPlusNotifier) -> None:
         logging.warning("[WEEKLY] 舆情周报异常: %s", e)
 
 
+def _maybe_evaluate_recommendation_outcomes(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
+    try:
+        if not should_evaluate_recommendations_today():
+            return
+        n = evaluate_recommendation_outcomes(broker.quote_ctx)
+        mark_recommendations_evaluated_today(n)
+        append_trade_log({"action": "RECOMMENDATION_REVIEW", "message": f"updated={n}"})
+        if n > 0 and os.getenv("TP_RECOMMENDATION_REVIEW_PUSH", "1").strip() not in ("0", "false", "False", "no", "NO"):
+            notifier.send(title="TradePilot 推荐复盘", content=build_recommendation_review_text())
+    except Exception as e:
+        append_trade_log({"action": "ERROR", "error": f"recommendation_review_failed: {type(e).__name__}: {e}"})
+
+
+def _maybe_run_weekly_backtest(notifier: PushPlusNotifier) -> None:
+    try:
+        weekly_weekday = int(os.getenv("TP_WEEKLY_BACKTEST_WEEKDAY", "6"))  # 0=Monday, 6=Sunday UTC
+        weekly_hhmm = os.getenv("TP_WEEKLY_BACKTEST_HHMM", "08:00")
+        if not should_run_weekly_backtest_now(target_weekday=weekly_weekday, target_hhmm=weekly_hhmm):
+            return
+        summary = run_weekly_backtest_3y()
+        mark_weekly_backtest_run(summary)
+        append_trade_log({"action": "WEEKLY_BACKTEST", "message": f"top={','.join(summary.get('top_symbols', []))}"})
+        if os.getenv("TP_WEEKLY_BACKTEST_PUSH", "1").strip() not in ("0", "false", "False", "no", "NO"):
+            notifier.send(title="TradePilot 每周3年回测", content=format_weekly_backtest_summary(summary))
+    except Exception as e:
+        append_trade_log({"action": "ERROR", "error": f"weekly_backtest_failed: {type(e).__name__}: {e}"})
+
+
 def main() -> None:
     # Prefer writing logs next to the executable (packaged) or cwd (source run).
     # Keep it simple and robust across environments.
@@ -2242,6 +2296,8 @@ def main() -> None:
                 _run_once(broker, notifier)
                 _maybe_send_daily_report_task(broker, notifier)
                 _maybe_evaluate_verdict_outcomes()
+                _maybe_evaluate_recommendation_outcomes(broker, notifier)
+                _maybe_run_weekly_backtest(notifier)
                 _maybe_send_weekly_verdict_review(notifier)
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
