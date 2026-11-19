@@ -317,6 +317,47 @@ class StrategyConfig:
     fundamental_pcf_scan_max_pages: int = int(os.getenv("TP_FUNDAMENTAL_PCF_SCAN_MAX_PAGES", "45"))
     fundamental_pcf_scan_page_size: int = int(os.getenv("TP_FUNDAMENTAL_PCF_SCAN_PAGE_SIZE", "200"))
 
+    # Rule-based multi-agent research scaffold. It records DecisionContext +
+    # bull/bear/risk/portfolio reviews for top candidates, but never changes orders.
+    agent_research_enabled: bool = os.getenv("TP_AGENT_RESEARCH_ENABLED", "1").strip() not in (
+        "0",
+        "false",
+        "False",
+        "no",
+        "NO",
+    )
+    agent_research_top_n: int = int(os.getenv("TP_AGENT_RESEARCH_TOP_N", "5"))
+    agent_research_llm_enabled: bool = os.getenv("TP_AGENT_RESEARCH_LLM_ENABLED", "0").strip() not in (
+        "0",
+        "false",
+        "False",
+        "no",
+        "NO",
+    )
+    agent_research_llm_model: str = os.getenv(
+        "TP_AGENT_RESEARCH_LLM_MODEL",
+        os.getenv("TP_CODEX_MODEL", "gpt-5.1-codex"),
+    )
+    agent_research_llm_base_url: str = os.getenv("TP_AGENT_RESEARCH_LLM_BASE_URL", os.getenv("TP_CODEX_BASE_URL", "https://api.openai.com/v1"))
+    agent_research_llm_timeout_s: float = float(os.getenv("TP_AGENT_RESEARCH_LLM_TIMEOUT_S", "25"))
+    agent_research_llm_max_retries: int = int(os.getenv("TP_AGENT_RESEARCH_LLM_MAX_RETRIES", "1"))
+    agent_research_llm_max_calls_per_day: int = int(os.getenv("TP_AGENT_RESEARCH_LLM_MAX_CALLS_PER_DAY", "5"))
+    agent_order_gate_enabled: bool = os.getenv("TP_AGENT_ORDER_GATE_ENABLED", "1").strip() not in (
+        "0",
+        "false",
+        "False",
+        "no",
+        "NO",
+    )
+    agent_order_gate_allow_unreviewed: bool = os.getenv("TP_AGENT_ORDER_GATE_ALLOW_UNREVIEWED", "0").strip() not in (
+        "0",
+        "false",
+        "False",
+        "no",
+        "NO",
+    )
+    agent_order_gate_min_confidence: int = int(os.getenv("TP_AGENT_ORDER_GATE_MIN_CONFIDENCE", "60"))
+
 
 FUTU = FutuConfig()
 STRATEGY = StrategyConfig()

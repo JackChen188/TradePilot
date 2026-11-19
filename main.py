@@ -90,6 +90,7 @@ from weekly_backtest_runner import (
     run_weekly_backtest_3y,
     should_run_weekly_backtest_now,
 )
+from agent_research import load_today_agent_portfolio_actions, run_daily_agent_research
 
 WATCHLIST_PATH = os.path.join("config", "watchlist.json")
 ALPHA_FACTOR_UNIVERSE_PATH = os.path.join("config", "alpha_factor_universe.json")
@@ -1812,6 +1813,64 @@ def _run_once(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
             append_trade_log({"action": "RECOMMENDATION_LOG", "message": f"logged={logged_n} top recommendations"})
     except Exception as e:
         append_trade_log({"action": "ERROR", "error": f"recommendation_log_failed: {type(e).__name__}: {e}"})
+    if bool(getattr(STRATEGY, "agent_research_enabled", True)) and scored:
+        try:
+            active_alpha_holding_count = len(
+                [x for x in holdings if int(x.qty) > 0 and str(x.symbol).upper() != core_symbol]
+            )
+            reviewed_n = run_daily_agent_research(
+                scored,
+                top_n=int(getattr(STRATEGY, "agent_research_top_n", 5)),
+                display_timezone=str(getattr(STRATEGY, "display_timezone", "Europe/Berlin")),
+                market_mode=market_mode,
+                market_allows_buy=market_allows_buy,
+                buy_paused=buy_paused,
+                risk_pause_reason=str(getattr(risk_state, "pause_reason", "") or ""),
+                account_drawdown_pct=float(getattr(risk_state, "drawdown_pct", 0.0) or 0.0),
+                risk_overlay_tone=str(getattr(risk_overlay, "tone", "") or ""),
+                risk_overlay_message=str(getattr(risk_overlay, "message", "") or ""),
+                available_cash=available_cash,
+                total_assets=total_assets,
+                core_symbol=core_symbol,
+                active_alpha_holding_count=active_alpha_holding_count,
+                holdings=holdings,
+                quote_ctx=broker.quote_ctx,
+                llm_enabled=bool(getattr(STRATEGY, "agent_research_llm_enabled", False)),
+                llm_api_key=os.getenv("OPENAI_API_KEY", ""),
+                llm_model=str(getattr(STRATEGY, "agent_research_llm_model", "gpt-5.1-codex")),
+                llm_base_url=str(getattr(STRATEGY, "agent_research_llm_base_url", "https://api.openai.com/v1")),
+                llm_timeout_s=float(getattr(STRATEGY, "agent_research_llm_timeout_s", 25.0)),
+                llm_max_retries=int(getattr(STRATEGY, "agent_research_llm_max_retries", 1)),
+                llm_max_calls_per_day=int(getattr(STRATEGY, "agent_research_llm_max_calls_per_day", 5)),
+            )
+            if reviewed_n > 0:
+                append_trade_log(
+                    {
+                        "action": "AGENT_RESEARCH_LOG",
+                        "message": f"reviewed={reviewed_n} top candidates; agent order gate may block pending BUY",
+                    }
+                )
+        except Exception as e:
+            append_trade_log({"action": "ERROR", "error": f"agent_research_failed: {type(e).__name__}: {e}"})
+    agent_action_map: dict[str, dict] = {}
+    if bool(getattr(STRATEGY, "agent_order_gate_enabled", True)):
+        try:
+            agent_action_map = load_today_agent_portfolio_actions(
+                display_timezone=str(getattr(STRATEGY, "display_timezone", "Europe/Berlin"))
+            )
+            append_trade_log(
+                {
+                    "action": "AGENT_ORDER_GATE",
+                    "message": (
+                        f"enabled reviewed={len(agent_action_map)} "
+                        f"allow_unreviewed={bool(getattr(STRATEGY, 'agent_order_gate_allow_unreviewed', False))} "
+                        f"min_confidence={int(getattr(STRATEGY, 'agent_order_gate_min_confidence', 60))}"
+                    ),
+                }
+            )
+        except Exception as e:
+            append_trade_log({"action": "ERROR", "error": f"agent_order_gate_load_failed: {type(e).__name__}: {e}"})
+            agent_action_map = {}
     core_value = float(core_qty) * float(core_price)
     alpha_value = max(0.0, float(total_assets) - float(core_value))
     alloc_text = f"CORE={core_value:.2f}({(core_value/total_assets*100.0) if total_assets>0 else 0.0:.1f}%), ALPHA={alpha_value:.2f}"
@@ -1977,6 +2036,48 @@ def _run_once(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
             code_u = best["code"]
             current = float(best["current"])
             ar = best["ar"]
+            agent_gate_text = "agent_gate=disabled"
+            if bool(getattr(STRATEGY, "agent_order_gate_enabled", True)):
+                action_info = agent_action_map.get(str(code_u).upper())
+                allow_unreviewed = bool(getattr(STRATEGY, "agent_order_gate_allow_unreviewed", False))
+                min_confidence = int(getattr(STRATEGY, "agent_order_gate_min_confidence", 60))
+                if not action_info:
+                    if not allow_unreviewed:
+                        append_trade_log(
+                            {
+                                "code": code_u,
+                                "action": "BUY_BLOCKED",
+                                "market_mode": market_mode,
+                                "message": "agent order gate: no same-day portfolio review",
+                            }
+                        )
+                        continue
+                    agent_gate_text = "agent_gate=unreviewed_allowed"
+                else:
+                    final_action = str(action_info.get("final_action", "") or "")
+                    confidence = int(action_info.get("portfolio_confidence", 0) or 0)
+                    flags = ",".join([str(x) for x in action_info.get("risk_flags", [])]) or "none"
+                    if final_action != "APPROVE_BUY":
+                        append_trade_log(
+                            {
+                                "code": code_u,
+                                "action": "BUY_BLOCKED",
+                                "market_mode": market_mode,
+                                "message": f"agent order gate: final_action={final_action or 'NA'} flags={flags}",
+                            }
+                        )
+                        continue
+                    if confidence < min_confidence:
+                        append_trade_log(
+                            {
+                                "code": code_u,
+                                "action": "BUY_BLOCKED",
+                                "market_mode": market_mode,
+                                "message": f"agent order gate: confidence {confidence}<{min_confidence} flags={flags}",
+                            }
+                        )
+                        continue
+                    agent_gate_text = f"agent_gate=APPROVE_BUY confidence={confidence} flags={flags}"
             base_plan = build_buy_plan(
                 code=code_u,
                 current_price=current,
@@ -2035,6 +2136,7 @@ def _run_once(broker: FutuLiveBroker, notifier: PushPlusNotifier) -> None:
                     reason=(
                         f"{ar.reason}; rank={best['rank_pct']*100.0:.1f}%; cash_pct={cash_pct:.2f}; "
                         f"fundamental_size={fundamental_size:.2f}; "
+                        f"{agent_gate_text}; "
                         f"{'ADD_POSITION' if is_add else 'INITIAL_ENTRY'}"
                     ),
                     holding_count=active_holdings_count,

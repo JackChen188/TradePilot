@@ -239,7 +239,7 @@ def build_daily_summary(*, broker, trade_log_path: str = TRADE_LOG_PATH) -> Dail
         e = str(r.get("error", "")).strip()
         if e:
             errs.append(e)
-        elif any(x in a for x in ("ERROR", "FATAL", "CYCLE")):
+        elif a in ("ERROR", "FATAL") or a.endswith("_ERROR"):
             msg = str(r.get("message", "")).strip()
             if msg:
                 errs.append(f"{a}: {msg}")
